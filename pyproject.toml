@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgelab"
+version = "0.1.0"
+description = "Market-agnostic strategy research, backtesting and demo-trading framework with hard risk controls"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyyaml>=6",
+    "pyarrow>=15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+data = ["dukascopy-python>=5"]
+ctrader = ["ctrader-open-api>=0.9", "twisted>=23", "service_identity>=21"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

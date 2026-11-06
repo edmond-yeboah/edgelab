@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+data/*.parquet
+data/*.csv
+experiments/
+.env
+
+# token store
+.ctrader_refresh_token
+*.refresh_token
