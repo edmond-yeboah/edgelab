@@ -185,13 +185,27 @@ class CTraderClient:
         Used on first connect and on reconnect. A failed refresh no longer blocks auth: we fall back
         to the current access token, so a transient refresh error doesn't lock the bot out.
         """
-        self._call(self._req("ProtoOAApplicationAuthReq", clientId=self.cfg.client_id,
-                              clientSecret=self.cfg.client_secret))
+        self._retry_call(lambda: self._req("ProtoOAApplicationAuthReq", clientId=self.cfg.client_id,
+                                           clientSecret=self.cfg.client_secret), "application auth")
         self._load_persisted_refresh_token()
         if self.cfg.refresh_token:
             self._try_refresh_token()   # best-effort; updates access_token on success
-        self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
-                             accessToken=self.cfg.access_token))
+        # account auth can transiently fail (e.g. CANT_ROUTE_REQUEST) on a flaky/just-woken server
+        self._retry_call(lambda: self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
+                                           accessToken=self.cfg.access_token), "account auth")
+
+    def _retry_call(self, make_msg, what: str, attempts: int = 4, delay: float = 3.0):
+        """Send a request, retrying a few times on a transient server error before giving up.
+        A fresh message is built each attempt. Raises the last error if all attempts fail."""
+        last = None
+        for _ in range(attempts):
+            try:
+                return self._call(make_msg())
+            except Exception as e:
+                last = e
+                log.warning("%s failed (%s); retrying in %ss", what, e, delay)
+                time.sleep(delay)
+        raise last
 
     def _try_refresh_token(self) -> bool:
         """Exchange the refresh token for a fresh access token. Returns True on success; on failure

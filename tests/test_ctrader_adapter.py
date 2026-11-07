@@ -121,6 +121,30 @@ def test_try_refresh_token_returns_false_on_error_instead_of_raising(monkeypatch
     assert c._try_refresh_token() is False
 
 
+def test_retry_call_retries_transient_errors_then_succeeds(monkeypatch):
+    from edgelab.brokers import ctrader as ct
+    monkeypatch.setattr(ct.time, "sleep", lambda s: None)   # no real waiting
+    c = CTraderClient(CTraderConfig("c", "s", "t", 1))
+    calls = {"n": 0}
+    def fake_call(msg):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise CTraderError("CANT_ROUTE_REQUEST", "Cannot route request")
+        return "ok"
+    c._call = fake_call
+    assert c._retry_call(lambda: object(), "account auth") == "ok"
+    assert calls["n"] == 3
+
+
+def test_retry_call_raises_after_exhausting_attempts(monkeypatch):
+    from edgelab.brokers import ctrader as ct
+    monkeypatch.setattr(ct.time, "sleep", lambda s: None)
+    c = CTraderClient(CTraderConfig("c", "s", "t", 1))
+    c._call = lambda msg: (_ for _ in ()).throw(CTraderError("NOPE", "x"))
+    with pytest.raises(CTraderError):
+        c._retry_call(lambda: object(), "account auth", attempts=2)
+
+
 def test_is_market_open_tracks_tick_freshness():
     c = CTraderClient(CTraderConfig("c", "s", "t", 1))
     c.symbols["EURUSD"] = 1
