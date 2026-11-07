@@ -126,7 +126,12 @@ class DemoRunner:
         else:
             # Real venue: the broker already reflects fills. Act on THIS just-closed bar's signal
             # at the next tick; the venue fills it. Then mark risk from live equity.
-            self.engine.on_signal(last, direction, stop_distance)
+            # Skip entering when the market is closed (no recent ticks) — avoids firing orders on
+            # weekends/holidays that can't fill. Risk is still marked so equity tracking continues.
+            if getattr(self.broker, "market_open", lambda: True)():
+                self.engine.on_signal(last, direction, stop_distance)
+            else:
+                log.info("%s: market closed (no recent ticks); holding, no new orders", self.name or "leg")
             self.engine.after_bar(last)
 
         if self.risk.kill_switch:
@@ -141,6 +146,9 @@ class DemoRunner:
             "position": None if pos is None else {"dir": pos.direction, "qty": pos.qty},
             "kill_switch": self.risk.kill_switch, "daily_halt": self.risk.daily_halt,
         }
+        realized = self.broker.pop_realized()
+        if realized:
+            data["closed"] = realized      # per-trade P&L for notifications
         if self.name:
             data = {"symbol": self.name, **data}
         self.on_event("bar", data)

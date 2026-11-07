@@ -136,6 +136,7 @@ class BasketRunner:
                 if client is not None and hasattr(client, "ensure_authenticated"):
                     try:
                         client.ensure_authenticated()
+                        self.on_event("recovered", {"ts": str(ts)})
                     except Exception as re:
                         log.warning("re-auth attempt failed: %s", re)
                 if consecutive_errors >= 5:

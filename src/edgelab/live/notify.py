@@ -64,6 +64,7 @@ class Notifier:
         self.heartbeat_every = heartbeat_every
         self._bars = 0
         self._last_position: dict[str, dict | None] = {}   # per symbol (basket-safe)
+        self._last_daily = 0.0                             # last daily-status send (epoch secs)
 
     def __call__(self, kind: str, data: dict) -> None:
         msg = self._format(kind, data)
@@ -86,25 +87,51 @@ class Notifier:
                 tag = f"{sym} " if sym else ""
                 return f"⏳ {tag}{data.get('ts')} equity=${data.get('equity')} pos={pos}"
             return None
+        if kind == "account":
+            # Once-a-day account summary, so you know it's alive even on a quiet/closed day.
+            now = time.time()
+            if now - self._last_daily >= 86400:
+                self._last_daily = now
+                ks = " ⚠️ KILL-SWITCH ON" if data.get("kill_switch") else ""
+                return f"📊 Daily status: equity=${data.get('equity')}{ks} — bot running."
+            return None
+        if kind == "started":
+            syms = ", ".join(data.get("symbols", [])) or "?"
+            return (f"✅ edgelab started — connected to {data.get('host', 'demo')} "
+                    f"(equity=${data.get('equity')}). Watching: {syms}.")
+        if kind == "recovered":
+            return "🔄 Reconnected to cTrader after an error — back to normal."
         if kind == "kill_switch":
             return f"🛑 KILL SWITCH: {data.get('reason')} @ {data.get('ts')}. Trading halted."
         if kind == "account_kill":
             return f"🛑 ACCOUNT KILL: {data.get('reason')} — equity=${data.get('equity')}. All flattened, stopped."
         if kind == "error":
-            return f"⚠️ error: {data.get('detail')}"
-        return None   # 'account' heartbeats etc. are not alerted (would spam)
+            return f"⚠️ Error: {data.get('detail')}"
+        return None
 
     def _position_change_msg(self, old, new, data, sym="") -> str | None:
         ts, eq = data.get("ts"), data.get("equity")
         tag = f"{sym} " if sym else ""
+        # realized P&L of a trade that just closed this bar (if any)
+        closed = data.get("closed") or []
+        pnl_str, reason = "", ""
+        if closed:
+            last = closed[-1]
+            reason = last.get("reason", "")
+            pnl = last.get("pnl")
+            if pnl is not None:
+                sign = "+" if pnl >= 0 else ""
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                pnl_str = f" {emoji} P&L {sign}{pnl:.2f}"
         if old is None and new is not None:
             side = "LONG" if new["dir"] > 0 else "SHORT"
             return f"📈 {tag}ENTRY {side} qty={new['qty']} @ {ts} equity=${eq}"
         if old is not None and new is None:
-            return f"📉 {tag}EXIT @ {ts} equity=${eq}"
+            rtag = f" ({reason})" if reason else ""
+            return f"📉 {tag}EXIT{rtag}{pnl_str} @ {ts} equity=${eq}"
         if old is not None and new is not None and old.get("dir") != new.get("dir"):
             side = "LONG" if new["dir"] > 0 else "SHORT"
-            return f"🔄 {tag}FLIP to {side} qty={new['qty']} @ {ts} equity=${eq}"
+            return f"🔄 {tag}FLIP to {side} qty={new['qty']}{pnl_str} @ {ts} equity=${eq}"
         return None
 
 

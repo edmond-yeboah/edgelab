@@ -55,7 +55,9 @@ class Broker(ABC):
         """Price used for sizing the next market order."""
 
     @abstractmethod
-    def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float) -> Position: ...
+    def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float) -> Position | None:
+        """Place a market order. Returns the Position once filled, or None if the order wasn't
+        filled (rejected, or market closed) — in which case the broker stays flat."""
 
     @abstractmethod
     def close_position(self, reason: str) -> None: ...
@@ -63,3 +65,9 @@ class Broker(ABC):
     @abstractmethod
     def pop_events(self) -> list[CloseEvent]:
         """Return and clear close events (stop-outs etc.) since the last call."""
+
+    def pop_realized(self) -> list[dict]:
+        """Return and clear realized-trade records since the last call, each
+        {pnl, reason, dir}. Used to surface per-trade profit/loss in notifications.
+        Default: none (brokers that track P&L override this)."""
+        return []

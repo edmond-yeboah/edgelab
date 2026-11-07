@@ -105,6 +105,7 @@ def main() -> None:
 
     clock = CTraderClock(client, a.timeframe, ref_symbol=a.symbols[0])
     clock.max_bars = a.max_bars
+    on_event("started", {"host": cfg.host_type, "equity": round(equity_fn(), 2), "symbols": a.symbols})
     BasketRunner(clock, legs, equity_fn,
                  cfg=BasketConfig(account_max_drawdown_pct=a.account_max_dd), on_event=on_event).run()
 

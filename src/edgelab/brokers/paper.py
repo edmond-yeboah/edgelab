@@ -26,6 +26,7 @@ class PaperBroker(Broker):
         self.cash = float(starting_equity)
         self._pos: Position | None = None
         self._events: list[CloseEvent] = []
+        self._realized: list[dict] = []
         self.trades: list[dict] = []
         self.equity_curve: list[tuple[pd.Timestamp, float]] = []
         self._ts: pd.Timestamp | None = None
@@ -66,6 +67,10 @@ class PaperBroker(Broker):
         ev, self._events = self._events, []
         return ev
 
+    def pop_realized(self) -> list[dict]:
+        r, self._realized = self._realized, []
+        return r
+
     # ---- bar replay (used by the backtester) ---------------------------
     def begin_bar(self, ts: pd.Timestamp, o: float, h: float, l: float, c: float) -> None:
         self._ts, self._o, self._h, self._l, self._c = ts, o, h, l, c
@@ -97,12 +102,14 @@ class PaperBroker(Broker):
         fees = p.entry_fee + exit_fee
         net = gross - fees
         self.cash += net
+        r_mult = net / p.risk_amount if p.risk_amount else float("nan")
         self.trades.append({
             "entry_time": p.entry_time, "exit_time": self._ts, "direction": p.direction,
             "qty": p.qty, "entry_price": p.entry_price, "exit_price": exit_px,
             "gross_pnl": gross, "fees": fees, "pnl": net,
-            "r_multiple": net / p.risk_amount if p.risk_amount else float("nan"),
+            "r_multiple": r_mult,
             "exit_reason": reason,
         })
+        self._realized.append({"pnl": round(net, 2), "reason": reason, "dir": p.direction, "r": r_mult})
         self._events.append(CloseEvent(p.direction, reason))
         self._pos = None

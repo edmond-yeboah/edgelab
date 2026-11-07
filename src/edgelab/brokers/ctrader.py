@@ -274,6 +274,7 @@ class CTraderClient:
                 d["bid"] = payload.bid / SCALE
             if payload.ask:
                 d["ask"] = payload.ask / SCALE
+            d["ts"] = time.time()   # last-tick time: lets us tell an open market from a closed one
         elif tn == "ProtoOAExecutionEvent":
             self._exec_events.append(payload)
 
@@ -343,6 +344,18 @@ class CTraderClient:
             return (d["bid"] + d["ask"]) / 2
         return None
 
+    def is_market_open(self, symbol: str, max_age: float = 300.0) -> bool:
+        """True if a live price tick arrived within max_age seconds. A closed market stops ticking,
+        so a stale or missing last tick means 'closed' — a broker-agnostic way to avoid firing
+        orders on weekends/holidays that can't fill (covers holidays too, not just weekends)."""
+        try:
+            d = self._spot.get(self.symbol_id(symbol))
+        except KeyError:
+            return False
+        if not d or "ts" not in d:
+            return False
+        return (time.time() - d["ts"]) < max_age
+
     # ---- trading -------------------------------------------------------
     def volume_from_units(self, symbol_id: int, units: float) -> int:
         """Convert base-currency units to cTrader volume (centi-units), snapped to the symbol step."""
@@ -398,6 +411,7 @@ class CTraderBroker(Broker):
         self.mode = ExecutionMode.DEMO if client.cfg.host_type == "demo" else ExecutionMode.LIVE
         self._pos: Position | None = None
         self._events: list[CloseEvent] = []
+        self._realized: list[dict] = []
         self._label_prefix = f"edgelab-{uuid.uuid4().hex[:8]}"
         self._n = 0
         assert_account_matches_mode(self.mode, client.account_is_live())
@@ -424,28 +438,54 @@ class CTraderBroker(Broker):
             return bal
         return bal + self._pos.direction * (px - self._pos.entry_price) * self._pos.qty
 
-    def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float) -> Position:
+    def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float) -> Position | None:
         if self._pos is not None:
             raise RuntimeError("one position at a time")
         label = self._next_label()
         self.client.new_market_order(self.symbol, direction, qty, stop_distance, label)
-        px = self.reference_price()
-        self._pos = Position(direction=direction, qty=qty, entry_price=px,
-                             stop=px - direction * stop_distance, entry_time=pd.Timestamp.utcnow(),
+        # Only record a position once the venue actually shows the fill (matched by our label). If the
+        # order was rejected or the market is closed, no position appears and we stay flat (no phantom).
+        venue = self._confirm_fill(label)
+        if venue is None:
+            log.warning("order NOT filled %s %s qty=%s label=%s (rejected or market closed); staying flat",
+                        self.symbol, "BUY" if direction > 0 else "SELL", qty, label)
+            return None
+        entry_px = venue["entry_price"] / SCALE
+        self._pos = Position(direction=direction, qty=qty, entry_price=entry_px,
+                             stop=entry_px - direction * stop_distance, entry_time=pd.Timestamp.utcnow(),
                              risk_amount=risk_amount)
         self._pos.label = label  # type: ignore[attr-defined]
-        self._adopt_venue_id()
-        log.info("order sent %s %s qty=%s label=%s", self.symbol, "BUY" if direction > 0 else "SELL", qty, label)
+        self._pos.venue_id = venue["positionId"]  # type: ignore[attr-defined]
+        log.info("order FILLED %s %s qty=%s @ %.5f label=%s",
+                 self.symbol, "BUY" if direction > 0 else "SELL", qty, entry_px, label)
         return self._pos
+
+    def _confirm_fill(self, label: str, attempts: int = 6, delay: float = 0.5) -> dict | None:
+        """Poll the venue for a position carrying our label — confirms the market order actually
+        filled. Fills can take a moment, so retry briefly before concluding it didn't."""
+        for _ in range(attempts):
+            for p in self.client.reconcile_positions():
+                if p.get("label") == label:
+                    return p
+            time.sleep(delay)
+        return None
+
+    def market_open(self) -> bool:
+        """Whether this symbol's market is currently open (live ticks arriving within ~5 min)."""
+        return self.client.is_market_open(self.symbol)
 
     def close_position(self, reason: str) -> None:
         if self._pos is None:
             return
-        vid = getattr(self._pos, "venue_id", 0)
-        vol = self.client.volume_from_units(self.client.symbol_id(self.symbol), self._pos.qty)
+        p = self._pos
+        exit_px = self.client.mid_price(self.symbol) or p.entry_price
+        pnl = p.direction * (exit_px - p.entry_price) * p.qty     # per-leg realized P&L estimate
+        vid = getattr(p, "venue_id", 0)
+        vol = self.client.volume_from_units(self.client.symbol_id(self.symbol), p.qty)
         if vid:
             self.client.close_position(vid, vol)
-        self._events.append(CloseEvent(self._pos.direction, reason))
+        self._realized.append({"pnl": round(pnl, 2), "reason": reason, "dir": p.direction})
+        self._events.append(CloseEvent(p.direction, reason))
         self._pos = None
         self.client._refresh_balance()
 
@@ -455,13 +495,23 @@ class CTraderBroker(Broker):
             try:
                 if self._pos is not None and ev.position.positionId == getattr(self._pos, "venue_id", -1) \
                         and ev.position.positionStatus == 2:  # CLOSED
-                    self._events.append(CloseEvent(self._pos.direction, "stop"))
+                    p = self._pos
+                    exit_px = getattr(p, "stop", float("nan"))
+                    if exit_px != exit_px:   # NaN: adopted position with no known stop
+                        exit_px = self.client.mid_price(self.symbol) or p.entry_price
+                    pnl = p.direction * (exit_px - p.entry_price) * p.qty
+                    self._realized.append({"pnl": round(pnl, 2), "reason": "stop", "dir": p.direction})
+                    self._events.append(CloseEvent(p.direction, "stop"))
                     self._pos = None
                     self.client._refresh_balance()
             except Exception:
                 pass
         ev, self._events = self._events, []
         return ev
+
+    def pop_realized(self) -> list[dict]:
+        r, self._realized = self._realized, []
+        return r
 
     # ---- helpers -------------------------------------------------------
     def _next_label(self) -> str:

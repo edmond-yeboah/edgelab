@@ -41,3 +41,47 @@ def test_from_env_returns_none_without_config():
     assert from_env({}) is None
     assert from_env({"TELEGRAM_BOT_TOKEN": "x"}) is None
     assert from_env({"TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "y"}) is not None
+
+
+def test_exit_message_includes_profit_and_reason():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("bar", {"ts": "t1", "equity": 500, "position": {"dir": 1, "qty": 1000}})       # entry
+    n("bar", {"ts": "t2", "equity": 530, "position": None,
+              "closed": [{"pnl": 30.0, "reason": "signal_exit", "dir": 1}]})          # exit, +30
+    joined = " | ".join(t.sent)
+    assert "EXIT" in joined and "signal_exit" in joined
+    assert "P&L +30.00" in joined and "🟢" in joined
+
+
+def test_exit_message_shows_a_loss():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("bar", {"ts": "t1", "equity": 500, "position": {"dir": -1, "qty": 1000}})
+    n("bar", {"ts": "t2", "equity": 480, "position": None,
+              "closed": [{"pnl": -20.0, "reason": "stop", "dir": -1}]})
+    joined = " | ".join(t.sent)
+    assert "EXIT (stop)" in joined and "P&L -20.00" in joined and "🔴" in joined
+
+
+def test_started_recovered_and_error_messages():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("started", {"host": "demo", "equity": 101000, "symbols": ["EURUSD", "BTCUSD"]})
+    n("recovered", {"ts": "t1"})
+    n("error", {"detail": "cycle error: boom"})
+    joined = " | ".join(t.sent)
+    assert "edgelab started" in joined and "EURUSD" in joined
+    assert "Reconnected" in joined
+    assert "Error: cycle error: boom" in joined
+
+
+def test_daily_account_summary_is_throttled_to_once_a_day():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("account", {"ts": "t1", "equity": 101000, "kill_switch": False})   # first -> sends
+    n("account", {"ts": "t2", "equity": 101050, "kill_switch": False})   # same day -> silent
+    assert len(t.sent) == 1 and "Daily status" in t.sent[0]
+    n._last_daily -= 86401                                               # a day passes
+    n("account", {"ts": "t3", "equity": 101100, "kill_switch": False})
+    assert len(t.sent) == 2
