@@ -76,6 +76,16 @@ def test_started_recovered_and_error_messages():
     assert "Error: cycle error: boom" in joined
 
 
+def test_market_open_and_close_messages():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("market_closed", {"symbol": "EURUSD", "ts": "t1"})
+    n("market_open", {"symbol": "EURUSD", "ts": "t2"})
+    joined = " | ".join(t.sent)
+    assert "EURUSD market closed" in joined
+    assert "EURUSD market open" in joined
+
+
 def test_daily_account_summary_is_throttled_to_once_a_day():
     t = LoggingTransport()
     n = Notifier(t)

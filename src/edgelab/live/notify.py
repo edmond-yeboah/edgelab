@@ -101,6 +101,10 @@ class Notifier:
                     f"(equity=${data.get('equity')}). Watching: {syms}.")
         if kind == "recovered":
             return "🔄 Reconnected to cTrader after an error — back to normal."
+        if kind == "market_closed":
+            return f"🌙 {data.get('symbol', '')} market closed — holding, no new trades until it reopens."
+        if kind == "market_open":
+            return f"🔆 {data.get('symbol', '')} market open — trading resumed."
         if kind == "kill_switch":
             return f"🛑 KILL SWITCH: {data.get('reason')} @ {data.get('ts')}. Trading halted."
         if kind == "account_kill":
