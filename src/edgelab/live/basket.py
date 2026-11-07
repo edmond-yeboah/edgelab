@@ -98,25 +98,53 @@ class BasketRunner:
         self.stopped_reason: str | None = None
 
     def run(self) -> None:
+        import time as _time
+        client = getattr(self.clock, "client", None)
+        consecutive_errors = 0
+        last_error_alert = 0.0
         while True:
             ts = self.clock.wait_next()
             if ts is None:
                 break
-            for leg in self.legs:
-                leg.process(ts)
-
-            eq = self.equity_fn()
-            self.account_risk.update(ts, eq)
-            self.on_event("account", {"ts": str(ts), "equity": round(eq, 2),
-                                      "kill_switch": self.account_risk.kill_switch})
-            if self.account_risk.kill_switch:
-                self.stopped_reason = self.account_risk.kill_reason
-                self.on_event("account_kill", {"ts": str(ts), "reason": self.account_risk.kill_reason,
-                                               "equity": round(eq, 2)})
+            try:
                 for leg in self.legs:
-                    if leg.broker.position() is not None:
-                        leg.broker.close_position("account_kill")
-                break
+                    leg.process(ts)
+
+                eq = self.equity_fn()
+                self.account_risk.update(ts, eq)
+                self.on_event("account", {"ts": str(ts), "equity": round(eq, 2),
+                                          "kill_switch": self.account_risk.kill_switch})
+                if self.account_risk.kill_switch:
+                    self.stopped_reason = self.account_risk.kill_reason
+                    self.on_event("account_kill", {"ts": str(ts), "reason": self.account_risk.kill_reason,
+                                                   "equity": round(eq, 2)})
+                    for leg in self.legs:
+                        if leg.broker.position() is not None:
+                            leg.broker.close_position("account_kill")
+                    break
+                consecutive_errors = 0
+            except Exception as e:
+                # A transient cTrader error (server reset, dropped connection, closed-market reply)
+                # must NOT crash the process into a restart loop. Log it, alert at most twice an hour,
+                # try to re-establish the session, and carry on to the next bar.
+                consecutive_errors += 1
+                log.warning("basket cycle error (%d in a row): %s", consecutive_errors, e)
+                now = _time.time()
+                if now - last_error_alert > 1800:
+                    self.on_event("error", {"detail": f"cycle error ({consecutive_errors}x): {e}"})
+                    last_error_alert = now
+                if client is not None and hasattr(client, "ensure_authenticated"):
+                    try:
+                        client.ensure_authenticated()
+                    except Exception as re:
+                        log.warning("re-auth attempt failed: %s", re)
+                if consecutive_errors >= 5:
+                    # persistently broken — exit so systemd brings up a fresh, fully-authed process
+                    log.error("5 consecutive cycle errors; exiting for a clean restart")
+                    raise SystemExit(1)
 
         for leg in self.legs:
-            leg.final_flatten()
+            try:
+                leg.final_flatten()
+            except Exception:
+                pass

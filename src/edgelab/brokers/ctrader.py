@@ -40,6 +40,18 @@ PERIOD_NAME = {"M1": "M1", "M5": "M5", "M15": "M15", "M30": "M30", "H1": "H1", "
 PERIOD_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
 
 
+class CTraderError(Exception):
+    """cTrader replied with ProtoOAErrorRes instead of the expected message.
+
+    Raised by _call so no caller ever reads a field (.trendbar/.symbol/.accessToken) off an error
+    object — that used to throw AttributeError and crash the whole process into a restart loop.
+    """
+    def __init__(self, code: str, description: str = ""):
+        self.code = code
+        self.description = description
+        super().__init__(f"cTrader error {code}: {description}" if description else f"cTrader error {code}")
+
+
 def _sdk():
     try:
         from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
@@ -124,17 +136,8 @@ class CTraderClient:
         if not self._connected.wait(self.call_timeout):
             raise ModeError("Timed out connecting to cTrader")
 
-        # app auth
-        self._call(self._req("ProtoOAApplicationAuthReq", clientId=self.cfg.client_id,
-                              clientSecret=self.cfg.client_secret))
-        # load any persisted (rotated) refresh token, then — if we have one — refresh the access
-        # token first so a restart after the old one expired still authenticates.
-        self._load_persisted_refresh_token()
-        if self.cfg.refresh_token:
-            self._refresh_token_blocking()        # also does account auth with the fresh token
-        else:
-            self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
-                                 accessToken=self.cfg.access_token))
+        # authenticate: app auth + (best-effort) token refresh + account auth
+        self._authenticate()
         log.info("cTrader connected + authed (account %s, host %s)", self.cfg.account_id, self.cfg.host_type)
 
         # heartbeat every 10s or the server drops us. Heartbeats get no response, so swallow the
@@ -151,7 +154,7 @@ class CTraderClient:
         # refresh the access token daily (it expires in ~30 days) so a long run never dies on expiry.
         if self.cfg.refresh_token:
             from twisted.internet import threads
-            rl = task.LoopingCall(lambda: threads.deferToThread(self._refresh_token_blocking))
+            rl = task.LoopingCall(lambda: threads.deferToThread(self._refresh_and_reauth))
             reactor.callFromThread(lambda: rl.start(24 * 3600, now=False))
 
         self._load_symbols()
@@ -176,19 +179,59 @@ class CTraderClient:
             except Exception as e:  # pragma: no cover
                 log.warning("could not write token store: %s", e)
 
-    def _refresh_token_blocking(self) -> None:
-        """Refresh the access token and re-auth. Runs from the MAIN or a worker thread (not reactor)."""
+    def _authenticate(self) -> None:
+        """App auth, then best-effort token refresh, then account auth with the best token available.
+
+        Used on first connect and on reconnect. A failed refresh no longer blocks auth: we fall back
+        to the current access token, so a transient refresh error doesn't lock the bot out.
+        """
+        self._call(self._req("ProtoOAApplicationAuthReq", clientId=self.cfg.client_id,
+                              clientSecret=self.cfg.client_secret))
+        self._load_persisted_refresh_token()
+        if self.cfg.refresh_token:
+            self._try_refresh_token()   # best-effort; updates access_token on success
+        self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
+                             accessToken=self.cfg.access_token))
+
+    def _try_refresh_token(self) -> bool:
+        """Exchange the refresh token for a fresh access token. Returns True on success; on failure
+        logs and returns False (never raises) so auth can fall back to the existing access token."""
         try:
             res = self._call(self._req("ProtoOARefreshTokenReq", refreshToken=self.cfg.refresh_token))
             self.cfg.access_token = res.accessToken
             if getattr(res, "refreshToken", ""):
                 self.cfg.refresh_token = res.refreshToken
                 self._persist_refresh_token(res.refreshToken)
-            self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
-                                 accessToken=self.cfg.access_token))
             log.info("access token refreshed (expires in ~%ss)", getattr(res, "expiresIn", "?"))
+            return True
         except Exception as e:
-            log.warning("token refresh failed (will retry next cycle): %s", e)
+            log.warning("token refresh failed (keeping current access token): %s", e)
+            return False
+
+    def _refresh_and_reauth(self) -> None:
+        """Daily token refresh + re-auth. Best-effort; never raises into the reactor loop."""
+        try:
+            if self._try_refresh_token():
+                self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
+                                     accessToken=self.cfg.access_token))
+        except Exception as e:
+            log.warning("re-auth after refresh failed (will retry next cycle): %s", e)
+
+    def ensure_authenticated(self) -> None:
+        """Re-establish the session after a disconnect/error: re-run auth and re-subscribe spots.
+
+        Called from the runner's error handler so a dropped connection self-heals by the next bar
+        instead of needing a process restart. Raises if the socket can't be re-authed."""
+        if not self._connected.wait(self.call_timeout):
+            raise ModeError("cTrader not connected")
+        self._authenticate()
+        for sid in list(self._spot.keys()):
+            try:
+                self._call(self._req("ProtoOASubscribeSpotsReq",
+                                     ctidTraderAccountId=self.cfg.account_id, symbolId=[sid]))
+            except Exception:
+                pass
+        log.info("cTrader session re-authenticated")
 
     def account_is_live(self) -> bool:
         # The demo host serves only demo accounts; auth above would have failed otherwise.
@@ -213,7 +256,11 @@ class CTraderClient:
         from twisted.internet import threads
         resp = threads.blockingCallFromThread(
             self._reactor, self._client.send, msg, None, self.call_timeout)
-        return self._s["Protobuf"].extract(resp)
+        extracted = self._s["Protobuf"].extract(resp)
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise CTraderError(str(getattr(extracted, "errorCode", "?")),
+                               str(getattr(extracted, "description", "")))
+        return extracted
 
     def _on_message(self, client, message):
         try:
@@ -232,11 +279,20 @@ class CTraderClient:
 
     # ---- reference data ------------------------------------------------
     def _load_symbols(self) -> None:
-        res = self._call(self._req("ProtoOASymbolsListReq", ctidTraderAccountId=self.cfg.account_id))
-        for sym in res.symbol:
-            norm = "".join(ch for ch in sym.symbolName.upper() if ch.isalnum())
-            self.symbols[norm] = sym.symbolId
-        # detailed specs (volume steps) for the symbols we will trade are fetched on demand
+        # detailed specs (volume steps) for the symbols we will trade are fetched on demand.
+        # Retry a few times so a brief server blip at startup doesn't fail the whole connect.
+        last = None
+        for _ in range(3):
+            try:
+                res = self._call(self._req("ProtoOASymbolsListReq", ctidTraderAccountId=self.cfg.account_id))
+                for sym in res.symbol:
+                    norm = "".join(ch for ch in sym.symbolName.upper() if ch.isalnum())
+                    self.symbols[norm] = sym.symbolId
+                return
+            except Exception as e:
+                last = e
+                time.sleep(2)
+        raise last
 
     def symbol_id(self, name: str) -> int:
         norm = "".join(ch for ch in name.upper() if ch.isalnum())

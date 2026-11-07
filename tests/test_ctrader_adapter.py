@@ -10,7 +10,7 @@ import types
 import pandas as pd
 import pytest
 
-from edgelab.brokers.ctrader import (CTraderBroker, CTraderClient, CTraderConfig,
+from edgelab.brokers.ctrader import (CTraderBroker, CTraderClient, CTraderConfig, CTraderError,
                                      decode_trendbars, PERIOD_MINUTES)
 from edgelab.mode import ExecutionMode, ModeError
 from edgelab.models import EURUSD
@@ -77,3 +77,44 @@ def test_volume_conversion_snaps_to_step_and_bounds():
 
 def test_known_timeframes():
     assert PERIOD_MINUTES["H1"] == 60 and "H4" in PERIOD_MINUTES
+
+
+def _client_with_fake_transport(monkeypatch, extracted):
+    """A CTraderClient whose _call returns `extracted` from the wire (no real network)."""
+    import twisted.internet.threads as tthreads
+    c = CTraderClient(CTraderConfig("c", "s", "t", 1))
+    c._reactor = object()
+    c._client = types.SimpleNamespace(send=lambda *a, **k: None)
+    monkeypatch.setattr(tthreads, "blockingCallFromThread", lambda reactor, fn, *a: "raw-resp")
+    c._s = dict(c._s)
+    c._s["Protobuf"] = types.SimpleNamespace(extract=lambda resp: extracted)
+    return c
+
+
+def test_call_raises_ctrader_error_on_error_response(monkeypatch):
+    # A ProtoOAErrorRes must become a clean CTraderError, never an AttributeError crash.
+    class ProtoOAErrorRes:
+        errorCode = "ACCOUNT_NOT_AUTHORIZED"
+        description = "token invalid"
+    c = _client_with_fake_transport(monkeypatch, ProtoOAErrorRes())
+    with pytest.raises(CTraderError) as ei:
+        c._call(object())
+    assert "ACCOUNT_NOT_AUTHORIZED" in str(ei.value)
+
+
+def test_call_returns_extracted_on_success(monkeypatch):
+    class ProtoOAAccountAuthRes:   # any non-error type passes through
+        pass
+    ok = ProtoOAAccountAuthRes()
+    c = _client_with_fake_transport(monkeypatch, ok)
+    assert c._call(object()) is ok
+
+
+def test_try_refresh_token_returns_false_on_error_instead_of_raising(monkeypatch):
+    # A failed refresh must not raise (so auth can fall back to the existing access token).
+    class ProtoOAErrorRes:
+        errorCode = "CH_ACCESS_TOKEN_INVALID"
+        description = ""
+    c = _client_with_fake_transport(monkeypatch, ProtoOAErrorRes())
+    c.cfg.refresh_token = "whatever"
+    assert c._try_refresh_token() is False
