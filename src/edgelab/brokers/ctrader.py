@@ -404,11 +404,12 @@ class CTraderClient:
                          stop_distance: float, label: str) -> dict:
         sid = self.symbol_id(symbol)
         side = self._s["Mo"].ProtoOATradeSide.Value("BUY" if direction > 0 else "SELL")
-        req = self._req("ProtoOANewOrderReq", ctidTraderAccountId=self.cfg.account_id, symbolId=sid,
-                        orderType=self._s["Mo"].ProtoOAOrderType.Value("MARKET"), tradeSide=side,
-                        volume=self.volume_from_units(sid, units), label=label,
-                        relativeStopLoss=int(round(stop_distance * SCALE)))
-        res = self._call(req)
+        fields = dict(ctidTraderAccountId=self.cfg.account_id, symbolId=sid,
+                      orderType=self._s["Mo"].ProtoOAOrderType.Value("MARKET"), tradeSide=side,
+                      volume=self.volume_from_units(sid, units), label=label)
+        if stop_distance and stop_distance > 0:
+            fields["relativeStopLoss"] = int(round(stop_distance * SCALE))
+        res = self._call(self._req("ProtoOANewOrderReq", **fields))
         # The DIRECT response to a new-order request carries the rejection reason here (it does not
         # come through the unsolicited _on_message path). Capture its errorCode so the rejection
         # alert can name it instead of falling back to the generic message.

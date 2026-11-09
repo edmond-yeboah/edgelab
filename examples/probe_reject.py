@@ -1,15 +1,16 @@
-"""Probe WHY XAUUSD / BTCUSD orders get rejected while EURUSD / GBPUSD fill.
+"""Probe WHY XAUUSD / BTCUSD orders don't fill while EURUSD / GBPUSD do.
 
-Run it with the bot STOPPED (so there's only one connection to cTrader):
+Run with the bot STOPPED (single clean connection), and with NO manual test positions open:
 
     sudo systemctl stop edgelab
     set -a; source .env; set +a
     python examples/probe_reject.py
     sudo systemctl start edgelab
 
-For each of gold and BTC it prints the symbol's volume spec and the FULL raw response to a
-market order (executionType, errorCode, description) — that names the exact reason. It closes
-any position it accidentally opens, so it leaves the account as it found it.
+For gold and BTC it sends a market order TWO ways — once with NO stop-loss, once WITH the
+server-side stop the bot attaches — and reports whether each one actually filled. If the
+no-stop one fills and the with-stop one doesn't, the attached stop is the culprit. It closes
+anything it opens, so the account is left as it was.
 """
 from __future__ import annotations
 
@@ -17,6 +18,20 @@ import os
 import time
 
 from edgelab.brokers.ctrader import CTraderClient, CTraderConfig
+
+
+def _cleanup(client, sid) -> bool:
+    filled = False
+    for p in client.reconcile_positions():
+        if p["symbolId"] == sid:
+            filled = True
+            print(f"    -> FILLED: position {p['positionId']} vol {p['volume']} — closing")
+            try:
+                client.close_position(p["positionId"], p["volume"])
+            except Exception as e:
+                print("       close error:", repr(e))
+            time.sleep(1)
+    return filled
 
 
 def main() -> None:
@@ -30,37 +45,27 @@ def main() -> None:
     client = CTraderClient(cfg)
     client.connect()
 
-    # representative stop distances in price units (gold ~ $20, BTC ~ $2000)
     for sym, qty, stop in [("XAUUSD", 6.0, 20.0), ("BTCUSD", 0.2, 2000.0)]:
+        sid = client.symbol_id(sym)
         print("=" * 60)
-        print(f"{sym}  qty={qty}  stop={stop}")
         try:
-            sid = client.symbol_id(sym)
             meta = client._ensure_symbol_meta(sid)
-            print(f"  symbolId={sid}  meta={meta}")
-            print(f"  volume_from_units({qty}) -> {client.volume_from_units(sid, qty)}")
-            print(f"  mid_price={client.mid_price(sym)}  market_open={client.is_market_open(sym)}")
+            print(f"{sym}  symbolId={sid}  meta={meta}  volume={client.volume_from_units(sid, qty)}")
         except Exception as e:
-            print("  meta/lookup error:", repr(e))
+            print(f"{sym}  meta error: {e!r}")
             continue
-        try:
-            res = client.new_market_order(sym, -1, qty, stop, f"probe-{sym}")
-            raw = res["raw"]
-            print("  response class:", type(raw).__name__)
-            print("  executionType:", getattr(raw, "executionType", None))
-            print("  errorCode:", getattr(raw, "errorCode", None))
-            print("  FULL >>>", " ".join(str(raw).split())[:1000])
-        except Exception as e:
-            print("  order raised:", repr(e))
-        time.sleep(2)
-        # leave the account clean: close anything that actually opened
-        try:
-            for p in client.reconcile_positions():
-                if p["symbolId"] == sid:
-                    print("  !! a position opened — closing it:", p["positionId"])
-                    client.close_position(p["positionId"], p["volume"])
-        except Exception as e:
-            print("  cleanup error:", repr(e))
+        for variant, stp in [("NO-STOP", 0.0), ("WITH-STOP", stop)]:
+            print(f"  --- {sym} {variant} (stop_distance={stp}) ---")
+            try:
+                raw = client.new_market_order(sym, -1, qty, stp, f"probe-{sym}")["raw"]
+                order = getattr(raw, "order", None)
+                print("    executionType:", getattr(raw, "executionType", None),
+                      "| executedVolume:", getattr(order, "executedVolume", None),
+                      "| errorCode:", repr(getattr(raw, "errorCode", "")))
+            except Exception as e:
+                print("    order raised:", repr(e))
+            time.sleep(2)
+            _cleanup(client, sid)
 
     print("=" * 60)
     print("done")
