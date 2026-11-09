@@ -96,7 +96,7 @@ class _ScriptClock:
         self._ts = list(ts_list)
         self.client = client
 
-    def wait_next(self):
+    def wait_next(self, on_poll=None, poll_interval=0.0):
         return self._ts.pop(0) if self._ts else None
 
 

@@ -27,8 +27,10 @@ log = logging.getLogger("edgelab.basket")
 
 class BarClock(ABC):
     @abstractmethod
-    def wait_next(self) -> pd.Timestamp | None:
-        """Block until the next bar is ready across all legs; return its ts, or None when done."""
+    def wait_next(self, on_poll=None, poll_interval: float = 0.0) -> pd.Timestamp | None:
+        """Block until the next bar is ready across all legs; return its ts, or None when done.
+        If on_poll is given, call it roughly every poll_interval seconds during the wait (used to
+        watch for mid-bar position closes). Clocks with no real wait (replay) ignore it."""
 
 
 class ReplayClock(BarClock):
@@ -37,7 +39,7 @@ class ReplayClock(BarClock):
     def __init__(self, sources: list[ReplaySource]):
         self.sources = sources
 
-    def wait_next(self) -> pd.Timestamp | None:
+    def wait_next(self, on_poll=None, poll_interval: float = 0.0) -> pd.Timestamp | None:
         ts = None
         for s in self.sources:
             t = s.wait_next_closed()
@@ -57,17 +59,19 @@ class CTraderClock(BarClock):
         self._bars = 0
         self.max_bars = None
 
-    def wait_next(self) -> pd.Timestamp | None:
+    def wait_next(self, on_poll=None, poll_interval: float = 0.0) -> pd.Timestamp | None:
         if self.max_bars is not None and self._bars >= self.max_bars:
             return None
         self._bars += 1
-        return self.client.wait_next_closed_bar(self.ref_symbol, self.timeframe)
+        return self.client.wait_next_closed_bar(self.ref_symbol, self.timeframe,
+                                                on_poll=on_poll, poll_interval=poll_interval)
 
 
 @dataclass
 class BasketConfig:
     account_max_drawdown_pct: float = 20.0   # account-level kill switch (flatten ALL, stop)
     account_daily_loss_pct: float = 5.0
+    watch_interval_secs: float = 90.0        # between-bar poll for mid-bar closes (0 = off)
 
 
 class BasketRunner:
@@ -103,7 +107,8 @@ class BasketRunner:
         consecutive_errors = 0
         last_error_alert = 0.0
         while True:
-            ts = self.clock.wait_next()
+            ts = self.clock.wait_next(on_poll=self._watch_all,
+                                      poll_interval=self.cfg.watch_interval_secs)
             if ts is None:
                 break
             try:
@@ -149,3 +154,13 @@ class BasketRunner:
                 leg.final_flatten()
             except Exception:
                 pass
+
+    def _watch_all(self) -> None:
+        """Called between bars (~every watch_interval_secs): notice any mid-bar stop-out and alert
+        promptly. Notification-only — never places or closes orders. Must never raise into the sleep."""
+        ts = pd.Timestamp.utcnow()
+        for leg in self.legs:
+            try:
+                leg.watch(ts)
+            except Exception as e:
+                log.warning("between-bar watch failed for %s: %s", getattr(leg, "name", "?"), e)

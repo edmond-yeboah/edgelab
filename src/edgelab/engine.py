@@ -64,6 +64,14 @@ class TradingEngine:
         if not math.isnan(eq):
             self.risk.update(ts, eq)
 
+    def absorb_closes(self) -> None:
+        """Detect venue-side closes (e.g. stop-outs) NOW, without running a bar.
+
+        Used by the between-bar watcher so a stop that fires mid-bar is noticed and alerted
+        promptly. It sets the re-entry cooldown exactly as a bar would, but does NOT decrement it
+        (that stays on the once-per-bar cadence in after_bar), so trading behaviour is unchanged."""
+        self._absorb_events()
+
     def _absorb_events(self) -> None:
         for ev in self.broker.pop_events():
             if ev.reason.startswith("stop"):

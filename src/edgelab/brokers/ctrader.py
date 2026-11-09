@@ -354,12 +354,25 @@ class CTraderClient:
             fromTimestamp=now_ms - (count + 5) * minutes * 60 * 1000, toTimestamp=now_ms, count=count))
         return decode_trendbars(res.trendbar)
 
-    def wait_next_closed_bar(self, symbol: str, timeframe: str) -> pd.Timestamp | None:
+    def wait_next_closed_bar(self, symbol: str, timeframe: str,
+                             on_poll=None, poll_interval: float = 0.0) -> pd.Timestamp | None:
         minutes = PERIOD_MINUTES[timeframe]
         period = pd.Timedelta(minutes=minutes)
         boundary = pd.Timestamp.utcnow().ceil(period)
         # +3s buffer so the just-closed bar is finalized server-side before we fetch
-        time.sleep(max(0.0, (boundary - pd.Timestamp.utcnow()).total_seconds()) + 3.0)
+        deadline = time.time() + max(0.0, (boundary - pd.Timestamp.utcnow()).total_seconds()) + 3.0
+        if on_poll and poll_interval and poll_interval > 0:
+            # Sleep in chunks, running the watch between them so a mid-bar stop-out is seen within
+            # ~poll_interval seconds instead of up to a whole bar later.
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(poll_interval, remaining))
+                if time.time() < deadline:   # skip the poll right at the boundary — the bar cycle handles it
+                    on_poll()
+        else:
+            time.sleep(max(0.0, deadline - time.time()))
         return boundary
 
     def subscribe_spots(self, symbol: str) -> None:

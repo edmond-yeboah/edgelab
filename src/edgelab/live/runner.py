@@ -98,6 +98,19 @@ class DemoRunner:
         self._emit_heartbeat(ts)
         return True
 
+    def watch(self, ts) -> bool:
+        """Between-bar health check (live legs only): notice a venue-side close — a stop-out that
+        fired mid-bar — and emit the exit alert right away, instead of waiting up to a full bar.
+        Notification-only: it never places or closes orders. Returns True if a position just closed."""
+        if self.broker.is_simulated:
+            return False
+        had_pos = self.broker.position() is not None
+        self.engine.absorb_closes()                       # drains exec events; clears _pos on a stop-out
+        closed = had_pos and self.broker.position() is None
+        if closed:
+            self._emit_heartbeat(ts)                      # carries position=None + realized P&L -> EXIT alert
+        return closed
+
     def final_flatten(self) -> None:
         # flatten any simulated open position so metrics are complete (real venues keep the position)
         if self.broker.is_simulated and self.broker.position() is not None:
