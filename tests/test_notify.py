@@ -93,6 +93,21 @@ def test_started_seeds_open_positions_so_restart_does_not_reannounce_entries():
     assert "EXIT" in " | ".join(t.sent)
 
 
+def test_rejected_order_alerts_with_reason_then_throttles_per_symbol():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("bar", {"symbol": "XAUUSD", "ts": "t1", "equity": 100000, "position": None,
+              "rejected": [{"symbol": "XAUUSD", "side": "SELL", "reason": "TRADING_BAD_VOLUME"}]})
+    assert any("XAUUSD" in m and "rejected" in m and "TRADING_BAD_VOLUME" in m for m in t.sent)
+    n0 = len(t.sent)
+    n("bar", {"symbol": "XAUUSD", "ts": "t2", "equity": 100000, "position": None,
+              "rejected": [{"symbol": "XAUUSD", "side": "SELL", "reason": "TRADING_BAD_VOLUME"}]})
+    assert len(t.sent) == n0                      # same symbol again -> throttled, no new alert
+    n("bar", {"symbol": "BTCUSD", "ts": "t3", "equity": 100000, "position": None,
+              "rejected": [{"symbol": "BTCUSD", "side": "SELL", "reason": "NOT_ENOUGH_MONEY"}]})
+    assert any("BTCUSD" in m and "NOT_ENOUGH_MONEY" in m for m in t.sent)   # different symbol still alerts
+
+
 def test_market_open_and_close_messages():
     t = LoggingTransport()
     n = Notifier(t)

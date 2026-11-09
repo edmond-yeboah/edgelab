@@ -114,6 +114,7 @@ class CTraderClient:
         self.symbol_meta: dict[int, dict] = {}   # symbolId -> {minVolume, stepVolume, maxVolume, digits}
         self._spot: dict[int, dict] = {}         # symbolId -> {bid, ask}
         self._exec_events: list = []
+        self._last_exec_error: dict[int, str] = {}   # symbolId -> last rejection errorCode
         self._balance: float | None = None
         self._money_digits = 2
         self.last_bar_may_be_open = True
@@ -291,6 +292,19 @@ class CTraderClient:
             d["ts"] = time.time()   # last-tick time: lets us tell an open market from a closed one
         elif tn == "ProtoOAExecutionEvent":
             self._exec_events.append(payload)
+            # Diagnostic: log the venue's execution type + error code for each order, so a rejected
+            # order (e.g. gold/BTC bouncing) tells us exactly WHY (lot size, trading disabled, etc.).
+            try:
+                et = getattr(payload, "executionType", None)
+                ec = getattr(payload, "errorCode", "") or ""
+                order = getattr(payload, "order", None)
+                sid = getattr(getattr(order, "tradeData", None), "symbolId", None)
+                sym = next((n for n, i in self.symbols.items() if i == sid), sid)
+                log.info("exec event: type=%s symbol=%s errorCode=%s", et, sym, ec)
+                if ec and sid is not None:
+                    self._last_exec_error[sid] = ec
+            except Exception:
+                pass
 
     # ---- reference data ------------------------------------------------
     def _load_symbols(self) -> None:
@@ -370,6 +384,13 @@ class CTraderClient:
             return False
         return (time.time() - d["ts"]) < max_age
 
+    def last_exec_error(self, symbol: str) -> str:
+        """Most recent execution-event errorCode for this symbol (why an order was rejected), or ''."""
+        try:
+            return self._last_exec_error.get(self.symbol_id(symbol), "")
+        except Exception:
+            return ""
+
     # ---- trading -------------------------------------------------------
     def volume_from_units(self, symbol_id: int, units: float) -> int:
         """Convert base-currency units to cTrader volume (centi-units), snapped to the symbol step."""
@@ -426,6 +447,7 @@ class CTraderBroker(Broker):
         self._pos: Position | None = None
         self._events: list[CloseEvent] = []
         self._realized: list[dict] = []
+        self._rejections: list[dict] = []
         self._label_prefix = f"edgelab-{uuid.uuid4().hex[:8]}"
         self._n = 0
         assert_account_matches_mode(self.mode, client.account_is_live())
@@ -461,8 +483,11 @@ class CTraderBroker(Broker):
         # order was rejected or the market is closed, no position appears and we stay flat (no phantom).
         venue = self._confirm_fill(label)
         if venue is None:
-            log.warning("order NOT filled %s %s qty=%s label=%s (rejected or market closed); staying flat",
-                        self.symbol, "BUY" if direction > 0 else "SELL", qty, label)
+            reason = self.client.last_exec_error(self.symbol) or "rejected or market closed"
+            side = "BUY" if direction > 0 else "SELL"
+            log.warning("order NOT filled %s %s qty=%s label=%s (%s); staying flat",
+                        self.symbol, side, qty, label, reason)
+            self._rejections.append({"symbol": self.symbol, "side": side, "reason": reason})
             return None
         entry_px = venue["entry_price"]   # position price is already in price units (a double), not 1e5-scaled
         self._pos = Position(direction=direction, qty=qty, entry_price=entry_px,
@@ -525,6 +550,10 @@ class CTraderBroker(Broker):
 
     def pop_realized(self) -> list[dict]:
         r, self._realized = self._realized, []
+        return r
+
+    def pop_rejections(self) -> list[dict]:
+        r, self._rejections = self._rejections, []
         return r
 
     # ---- helpers -------------------------------------------------------

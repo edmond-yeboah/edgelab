@@ -65,6 +65,7 @@ class Notifier:
         self._bars = 0
         self._last_position: dict[str, dict | None] = {}   # per symbol (basket-safe)
         self._last_daily = 0.0                             # last daily-status send (epoch secs)
+        self._last_reject_alert: dict[str, float] = {}     # per symbol: last rejection alert (epoch secs)
 
     def __call__(self, kind: str, data: dict) -> None:
         msg = self._format(kind, data)
@@ -76,6 +77,13 @@ class Notifier:
         if kind == "bar":
             self._bars += 1
             sym = data.get("symbol", "")
+            # rejected-order alert — throttled per symbol so gold/BTC bouncing every bar isn't spam
+            for r in data.get("rejected", []):
+                rs = r.get("symbol", sym)
+                now = time.time()
+                if now - self._last_reject_alert.get(rs, 0.0) >= 21600:   # at most once per 6h per symbol
+                    self._last_reject_alert[rs] = now
+                    return f"⚠️ {rs} {r.get('side', '')} order rejected — {r.get('reason')} (no trade placed)."
             pos = data.get("position")
             # Detect entry/exit/flip per symbol by watching the position field change between bars.
             if pos != self._last_position.get(sym):

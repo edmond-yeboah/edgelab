@@ -71,3 +71,9 @@ class Broker(ABC):
         {pnl, reason, dir}. Used to surface per-trade profit/loss in notifications.
         Default: none (brokers that track P&L override this)."""
         return []
+
+    def pop_rejections(self) -> list[dict]:
+        """Return and clear rejected-order records since the last call, each
+        {symbol, side, reason}. Used to alert when an order didn't place.
+        Default: none (brokers that can be rejected override this)."""
+        return []

@@ -128,7 +128,13 @@ class DemoRunner:
             # at the next tick; the venue fills it. Then mark risk from live equity.
             # Skip entering when the market is closed (no recent ticks) — avoids firing orders on
             # weekends/holidays that can't fill. Risk is still marked so equity tracking continues.
-            if getattr(self.broker, "market_open", lambda: True)():
+            is_open = getattr(self.broker, "market_open", lambda: True)()
+            if is_open != self._market_open_prev:
+                if self._market_open_prev is not None:   # notify only on a real open<->close transition
+                    self.on_event("market_open" if is_open else "market_closed",
+                                  {"symbol": self.name, "ts": str(last)})
+                self._market_open_prev = is_open
+            if is_open:
                 self.engine.on_signal(last, direction, stop_distance)
             else:
                 log.info("%s: market closed (no recent ticks); holding, no new orders", self.name or "leg")
@@ -138,6 +144,7 @@ class DemoRunner:
             self.on_event("kill_switch", {"reason": self.risk.kill_reason, "ts": str(last)})
 
     _prev_signal = None
+    _market_open_prev = None
 
     def _emit_heartbeat(self, ts) -> None:
         pos = self.broker.position()
@@ -149,6 +156,9 @@ class DemoRunner:
         realized = self.broker.pop_realized()
         if realized:
             data["closed"] = realized      # per-trade P&L for notifications
+        rejected = self.broker.pop_rejections()
+        if rejected:
+            data["rejected"] = rejected    # order-rejection alerts (symbol, side, reason)
         if self.name:
             data = {"symbol": self.name, **data}
         self.on_event("bar", data)

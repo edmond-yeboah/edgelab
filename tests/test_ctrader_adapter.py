@@ -167,6 +167,7 @@ class _FillClient:
     def symbol_id(self, name): return 1
     def reconcile_positions(self): return list(self._positions)
     def is_market_open(self, symbol, max_age=300): return True
+    def last_exec_error(self, symbol): return ""
     def mid_price(self, symbol): return 1.10
     def balance(self): return 100000.0
     def volume_from_units(self, sid, qty): return int(qty * 100)
