@@ -464,7 +464,7 @@ class CTraderBroker(Broker):
             log.warning("order NOT filled %s %s qty=%s label=%s (rejected or market closed); staying flat",
                         self.symbol, "BUY" if direction > 0 else "SELL", qty, label)
             return None
-        entry_px = venue["entry_price"] / SCALE
+        entry_px = venue["entry_price"]   # position price is already in price units (a double), not 1e5-scaled
         self._pos = Position(direction=direction, qty=qty, entry_price=entry_px,
                              stop=entry_px - direction * stop_distance, entry_time=pd.Timestamp.utcnow(),
                              risk_amount=risk_amount)
@@ -539,7 +539,7 @@ class CTraderBroker(Broker):
                 return
 
     def _adopt(self, p: dict) -> Position:
-        pos = Position(direction=p["direction"], qty=p["volume"] / 100.0, entry_price=p["entry_price"] / SCALE,
+        pos = Position(direction=p["direction"], qty=p["volume"] / 100.0, entry_price=p["entry_price"],
                        stop=float("nan"), entry_time=pd.Timestamp.utcnow(), risk_amount=0.0)
         pos.venue_id = p["positionId"]  # type: ignore[attr-defined]
         pos.label = p.get("label", "")  # type: ignore[attr-defined]

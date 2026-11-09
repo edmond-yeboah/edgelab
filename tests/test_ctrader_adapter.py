@@ -173,8 +173,9 @@ class _FillClient:
     def new_market_order(self, symbol, direction, units, stop, label):
         self.orders.append(label)
         if self.fills:
+            # cTrader position price is a plain price (double), not a 1e5-scaled integer
             self._positions.append({"positionId": 555, "direction": direction,
-                                    "volume": int(units * 100), "entry_price": 110000,
+                                    "volume": int(units * 100), "entry_price": 1.10,
                                     "label": label, "symbolId": 1})
         return {"raw": None}
 
@@ -200,3 +201,18 @@ def test_submit_market_stays_flat_when_fill_not_confirmed(monkeypatch):
 
 def test_broker_market_open_delegates_to_client():
     assert CTraderBroker(_FillClient(), "EURUSD", EURUSD).market_open() is True
+
+
+def test_adopt_uses_position_price_directly_not_scaled():
+    b = CTraderBroker(_FillClient(), "EURUSD", EURUSD)
+    pos = b._adopt({"direction": 1, "volume": 100000, "entry_price": 1.2345, "positionId": 7, "label": "x"})
+    assert pos.entry_price == 1.2345 and pos.qty == 1000.0
+
+
+def test_equity_stays_near_balance_not_garbage():
+    # Regression: a price-scaling bug once stored entry ~0.0000115, making equity explode to
+    # tens/hundreds of thousands off. With entry = mid, unrealized ≈ 0 and equity ≈ balance.
+    c = _FillClient(fills=True)
+    b = CTraderBroker(c, "EURUSD", EURUSD)
+    b.submit_market(1, 1000.0, 0.001, 50.0)        # entry 1.10, mid 1.10
+    assert abs(b.equity() - 100000.0) < 1.0
