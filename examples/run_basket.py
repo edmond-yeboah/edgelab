@@ -105,7 +105,12 @@ def main() -> None:
 
     clock = CTraderClock(client, a.timeframe, ref_symbol=a.symbols[0])
     clock.max_bars = a.max_bars
-    on_event("started", {"host": cfg.host_type, "equity": round(equity_fn(), 2), "symbols": a.symbols})
+    startup_positions = {}
+    for leg in legs:
+        p = leg.broker.position()
+        startup_positions[leg.name] = None if p is None else {"dir": p.direction, "qty": p.qty}
+    on_event("started", {"host": cfg.host_type, "equity": round(equity_fn(), 2),
+                         "symbols": a.symbols, "positions": startup_positions})
     BasketRunner(clock, legs, equity_fn,
                  cfg=BasketConfig(account_max_drawdown_pct=a.account_max_dd), on_event=on_event).run()
 

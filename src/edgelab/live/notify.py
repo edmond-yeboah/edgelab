@@ -96,9 +96,16 @@ class Notifier:
                 return f"📊 Daily status: equity=${data.get('equity')}{ks} — bot running."
             return None
         if kind == "started":
+            # Seed the per-symbol baseline with any positions already open (adopted on restart),
+            # so the first bar after a restart doesn't re-announce them as brand-new entries.
+            positions = data.get("positions") or {}
+            for sym, pos in positions.items():
+                self._last_position[sym] = pos
+            open_ps = [f"{s} {'LONG' if p['dir'] > 0 else 'SHORT'}" for s, p in positions.items() if p]
             syms = ", ".join(data.get("symbols", [])) or "?"
+            held = f" Resuming {len(open_ps)} open: {', '.join(open_ps)}." if open_ps else ""
             return (f"✅ edgelab started — connected to {data.get('host', 'demo')} "
-                    f"(equity=${data.get('equity')}). Watching: {syms}.")
+                    f"(equity=${data.get('equity')}). Watching: {syms}.{held}")
         if kind == "recovered":
             return "🔄 Reconnected to cTrader after an error — back to normal."
         if kind == "market_closed":

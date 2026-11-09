@@ -76,6 +76,23 @@ def test_started_recovered_and_error_messages():
     assert "Error: cycle error: boom" in joined
 
 
+def test_started_seeds_open_positions_so_restart_does_not_reannounce_entries():
+    t = LoggingTransport()
+    n = Notifier(t)
+    # Restart with an already-open (adopted) EURUSD short
+    n("started", {"host": "demo", "equity": 100000, "symbols": ["EURUSD"],
+                  "positions": {"EURUSD": {"dir": -1, "qty": 85000.0}}})
+    # First bar after restart shows that same position — must NOT be announced as an ENTRY
+    n("bar", {"symbol": "EURUSD", "ts": "t1", "equity": 100000, "position": {"dir": -1, "qty": 85000.0}})
+    joined = " | ".join(t.sent)
+    assert "Resuming 1 open: EURUSD SHORT" in joined
+    assert "ENTRY" not in joined
+    # A genuine change (the exit) still alerts
+    n("bar", {"symbol": "EURUSD", "ts": "t2", "equity": 100100, "position": None,
+              "closed": [{"pnl": 100.0, "reason": "signal_exit", "dir": -1}]})
+    assert "EXIT" in " | ".join(t.sent)
+
+
 def test_market_open_and_close_messages():
     t = LoggingTransport()
     n = Notifier(t)
