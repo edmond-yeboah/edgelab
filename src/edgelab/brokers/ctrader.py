@@ -409,6 +409,17 @@ class CTraderClient:
                         volume=self.volume_from_units(sid, units), label=label,
                         relativeStopLoss=int(round(stop_distance * SCALE)))
         res = self._call(req)
+        # The DIRECT response to a new-order request carries the rejection reason here (it does not
+        # come through the unsolicited _on_message path). Capture its errorCode so the rejection
+        # alert can name it instead of falling back to the generic message.
+        try:
+            ec = getattr(res, "errorCode", "") or ""
+            et = getattr(res, "executionType", None)
+            log.info("new-order response %s: type=%s errorCode=%s", symbol, et, ec)
+            if ec:
+                self._last_exec_error[sid] = ec
+        except Exception:
+            pass
         return {"raw": res}
 
     def close_position(self, position_id: int, volume: int) -> dict:
