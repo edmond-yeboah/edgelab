@@ -200,6 +200,68 @@ def test_submit_market_stays_flat_when_fill_not_confirmed(monkeypatch):
     assert c.orders                                          # the order WAS sent
 
 
+class _OddLabelClient(_FillClient):
+    """Fill lands on the symbol but the broker returns a different/empty label (an async-fill quirk).
+    The confirm-by-symbol fallback must still catch it so the position is tracked, not orphaned."""
+    def new_market_order(self, symbol, direction, units, stop, label):
+        self.orders.append(label)
+        self._positions.append({"positionId": 777, "direction": direction,
+                                "volume": int(units * 100), "entry_price": 1.10,
+                                "label": "", "symbolId": 1})   # label does NOT match ours
+        return {"raw": None}
+
+
+def test_fill_confirmed_by_symbol_when_label_does_not_match():
+    c = _OddLabelClient()
+    b = CTraderBroker(c, "EURUSD", EURUSD)
+    pos = b.submit_market(1, 1000.0, 0.001, 50.0)
+    assert pos is not None and getattr(b.position(), "venue_id", None) == 777   # caught, not orphaned
+    assert len(c.orders) == 1                                                   # no needless retry
+
+
+class _SecondTryClient(_FillClient):
+    """First order 0-fills (IOC miss), second fills — mimics gold/BTC at a jumpy bar close."""
+    def __init__(self):
+        super().__init__(fills=True)
+        self._tries = 0
+    def new_market_order(self, symbol, direction, units, stop, label):
+        self.orders.append(label)
+        self._tries += 1
+        if self._tries >= 2:   # only the 2nd attempt fills
+            self._positions.append({"positionId": 888, "direction": direction,
+                                    "volume": int(units * 100), "entry_price": 1.10,
+                                    "label": label, "symbolId": 1})
+        return {"raw": None}
+
+
+def test_order_retries_into_a_fill(monkeypatch):
+    from edgelab.brokers import ctrader as ct
+    monkeypatch.setattr(ct.time, "sleep", lambda s: None)
+    c = _SecondTryClient()
+    b = CTraderBroker(c, "EURUSD", EURUSD)
+    pos = b.submit_market(1, 1000.0, 0.001, 50.0)
+    assert pos is not None and b.position() is not None     # the retry caught the fill
+    assert len(c.orders) == 2                               # took exactly two attempts
+    assert not b.pop_rejections()                           # a retried-then-filled order is not a rejection
+
+
+class _HardRejectClient(_FillClient):
+    """A hard rejection (bad volume) must stop immediately — retrying can't fix it."""
+    def __init__(self):
+        super().__init__(fills=False)
+    def last_exec_error(self, symbol): return "TRADING_BAD_VOLUME"
+
+
+def test_hard_rejection_does_not_retry(monkeypatch):
+    from edgelab.brokers import ctrader as ct
+    monkeypatch.setattr(ct.time, "sleep", lambda s: None)
+    c = _HardRejectClient()
+    b = CTraderBroker(c, "EURUSD", EURUSD)
+    assert b.submit_market(1, 1000.0, 0.001, 50.0) is None
+    assert len(c.orders) == 1                                       # stopped after one try
+    assert any(r["reason"] == "TRADING_BAD_VOLUME" for r in b.pop_rejections())
+
+
 def test_broker_market_open_delegates_to_client():
     assert CTraderBroker(_FillClient(), "EURUSD", EURUSD).market_open() is True
 

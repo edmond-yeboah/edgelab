@@ -486,38 +486,78 @@ class CTraderBroker(Broker):
             return bal
         return bal + self._pos.direction * (px - self._pos.entry_price) * self._pos.qty
 
-    def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float) -> Position | None:
+    # Hard rejections won't fix themselves on a retry — stop immediately and report them.
+    _HARD_REJECTS = {"TRADING_BAD_VOLUME", "TRADING_BAD_PRICES", "NOT_ENOUGH_MONEY",
+                     "POSITION_NOT_FOUND", "TRADING_DISABLED", "SHORT_SELLING_NOT_ALLOWED"}
+
+    def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float,
+                      attempts: int = 3) -> Position | None:
+        """Place a market order and confirm it actually opened a position on the venue.
+
+        Gold/BTC are wider and jumpier than EUR/GBP: a single IMMEDIATE_OR_CANCEL market order can
+        come back 0-filled at the exact bar-close instant, even though the identical order fills a
+        moment later. So we retry into a fillable moment — but reconcile the symbol BEFORE every
+        attempt, so a fill from a previous try is adopted instead of stacked (never a double-fill).
+        We confirm by our label OR by any new position on this symbol (we were flat before ordering),
+        so a late or oddly-labelled async fill is tracked, never orphaned."""
         if self._pos is not None:
             raise RuntimeError("one position at a time")
-        label = self._next_label()
-        self.client.new_market_order(self.symbol, direction, qty, stop_distance, label)
-        # Only record a position once the venue actually shows the fill (matched by our label). If the
-        # order was rejected or the market is closed, no position appears and we stay flat (no phantom).
-        venue = self._confirm_fill(label)
+        sid = self.client.symbol_id(self.symbol)
+        side = "BUY" if direction > 0 else "SELL"
+        venue = None
+
+        for attempt in range(1, attempts + 1):
+            # Did a prior attempt (or a slow async fill) already open a position on this symbol?
+            # We hold at most one per symbol, so adopt it rather than firing again.
+            existing = [p for p in self.client.reconcile_positions() if p["symbolId"] == sid]
+            if existing:
+                venue = existing[0]
+                break
+
+            label = self._next_label()
+            self.client.new_market_order(self.symbol, direction, qty, stop_distance, label)
+            venue = self._confirm_fill(sid, label)
+            if venue is not None:
+                break
+
+            err = self.client.last_exec_error(self.symbol)
+            if err in self._HARD_REJECTS:
+                log.warning("order rejected %s %s: %s — not retrying", self.symbol, side, err)
+                break
+            log.info("order %s %s not filled on attempt %d/%d (%s); retrying",
+                     self.symbol, side, attempt, attempts, err or "0-fill, no error")
+
         if venue is None:
-            reason = self.client.last_exec_error(self.symbol) or "rejected or market closed"
-            side = "BUY" if direction > 0 else "SELL"
-            log.warning("order NOT filled %s %s qty=%s label=%s (%s); staying flat",
-                        self.symbol, side, qty, label, reason)
+            reason = self.client.last_exec_error(self.symbol) or "not filled after retries"
+            log.warning("order NOT filled %s %s qty=%s (%s); staying flat",
+                        self.symbol, side, qty, reason)
             self._rejections.append({"symbol": self.symbol, "side": side, "reason": reason})
             return None
+
         entry_px = venue["entry_price"]   # position price is already in price units (a double), not 1e5-scaled
-        self._pos = Position(direction=direction, qty=qty, entry_price=entry_px,
-                             stop=entry_px - direction * stop_distance, entry_time=pd.Timestamp.utcnow(),
+        filled_qty = venue["volume"] / 100.0 or qty   # trust the venue's actual fill size
+        vdir = venue["direction"]
+        self._pos = Position(direction=vdir, qty=filled_qty, entry_price=entry_px,
+                             stop=entry_px - vdir * stop_distance, entry_time=pd.Timestamp.utcnow(),
                              risk_amount=risk_amount)
-        self._pos.label = label  # type: ignore[attr-defined]
+        self._pos.label = venue.get("label", "")  # type: ignore[attr-defined]
         self._pos.venue_id = venue["positionId"]  # type: ignore[attr-defined]
         log.info("order FILLED %s %s qty=%s @ %.5f label=%s",
-                 self.symbol, "BUY" if direction > 0 else "SELL", qty, entry_px, label)
+                 self.symbol, side, filled_qty, entry_px, self._pos.label)
         return self._pos
 
-    def _confirm_fill(self, label: str, attempts: int = 6, delay: float = 0.5) -> dict | None:
-        """Poll the venue for a position carrying our label — confirms the market order actually
-        filled. Fills can take a moment, so retry briefly before concluding it didn't."""
+    def _confirm_fill(self, sid: int, label: str, attempts: int = 10, delay: float = 0.5) -> dict | None:
+        """Poll the venue for the fill. Match our label first; fall back to ANY position on this
+        symbol — we were flat before ordering, so a new one is ours even if the label comes back
+        empty or altered. ~5s window (10 x 0.5s) covers a slow async fill."""
         for _ in range(attempts):
-            for p in self.client.reconcile_positions():
+            positions = self.client.reconcile_positions()
+            for p in positions:
                 if p.get("label") == label:
                     return p
+            on_sym = [p for p in positions if p["symbolId"] == sid]
+            if on_sym:
+                return on_sym[0]
             time.sleep(delay)
         return None
 
