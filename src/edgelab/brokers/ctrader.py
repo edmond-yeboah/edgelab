@@ -413,6 +413,19 @@ class CTraderClient:
         vol = math.floor(vol / step) * step
         return int(max(meta["minVolume"], min(vol, meta["maxVolume"])))
 
+    def relative_stop_from_distance(self, symbol_id: int, stop_distance: float) -> int:
+        """Convert a price-unit stop distance to cTrader's relativeStopLoss (1/100000 of a price
+        unit), snapped to the symbol's price grid.
+
+        cTrader rejects a relativeStopLoss that isn't a whole number of ticks (INVALID_REQUEST).
+        FX pairs have digits=5, so any integer is a whole tick. Gold/BTC have digits=2, so the
+        value must be a multiple of 10**(5-digits) = 1000 — a raw ATR stop like 64.5197 is not.
+        Round to the nearest tick, and never below one tick (a zero stop would be invalid too)."""
+        digits = int(self._ensure_symbol_meta(symbol_id)["digits"])
+        grid = 10 ** max(0, int(math.log10(SCALE)) - digits)    # SCALE=1e5 -> 1 for 5 digits, 1000 for 2
+        steps = max(1, round(stop_distance * SCALE / grid))
+        return int(steps * grid)
+
     def new_market_order(self, symbol: str, direction: int, units: float,
                          stop_distance: float, label: str) -> dict:
         sid = self.symbol_id(symbol)
@@ -421,7 +434,7 @@ class CTraderClient:
                       orderType=self._s["Mo"].ProtoOAOrderType.Value("MARKET"), tradeSide=side,
                       volume=self.volume_from_units(sid, units), label=label)
         if stop_distance and stop_distance > 0:
-            fields["relativeStopLoss"] = int(round(stop_distance * SCALE))
+            fields["relativeStopLoss"] = self.relative_stop_from_distance(sid, stop_distance)
         res = self._call(self._req("ProtoOANewOrderReq", **fields))
         # The DIRECT response to a new-order request carries the rejection reason here (it does not
         # come through the unsolicited _on_message path). Capture its errorCode so the rejection
@@ -500,7 +513,7 @@ class CTraderBroker(Broker):
         return bal + self._pos.direction * (px - self._pos.entry_price) * self._pos.qty
 
     # Hard rejections won't fix themselves on a retry — stop immediately and report them.
-    _HARD_REJECTS = {"TRADING_BAD_VOLUME", "TRADING_BAD_PRICES", "NOT_ENOUGH_MONEY",
+    _HARD_REJECTS = {"INVALID_REQUEST", "TRADING_BAD_VOLUME", "TRADING_BAD_PRICES", "NOT_ENOUGH_MONEY",
                      "POSITION_NOT_FOUND", "TRADING_DISABLED", "SHORT_SELLING_NOT_ALLOWED"}
 
     def submit_market(self, direction: int, qty: float, stop_distance: float, risk_amount: float,

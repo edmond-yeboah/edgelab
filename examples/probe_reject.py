@@ -45,7 +45,9 @@ def main() -> None:
     client = CTraderClient(cfg)
     client.connect()
 
-    for sym, qty, stop in [("XAUUSD", 6.0, 20.0), ("BTCUSD", 0.2, 2000.0)]:
+    # Stops are deliberately the RAW, non-round ATR values production sends (not 20.0 / 2000.0):
+    # round numbers happened to be valid tick multiples and hid the INVALID_REQUEST bug.
+    for sym, qty, stop in [("XAUUSD", 6.0, 64.51975218141366), ("BTCUSD", 0.2, 2009.4990976184747)]:
         sid = client.symbol_id(sym)
         print("=" * 60)
         try:

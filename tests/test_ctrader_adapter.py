@@ -76,6 +76,23 @@ def test_volume_conversion_snaps_to_step_and_bounds():
     assert c.volume_from_units(1, 100) == 100000
 
 
+def test_relative_stop_is_snapped_to_symbol_tick_grid():
+    # Regression: gold/BTC (digits=2) were rejected INVALID_REQUEST because the raw ATR stop
+    # produced a relativeStopLoss that wasn't a whole number of ticks (multiple of 1000).
+    # Values below are the real ones from the production probe.
+    c = CTraderClient(CTraderConfig("c", "s", "t", 1))
+    c.symbol_meta[1] = {"minVolume": 100000, "stepVolume": 100000, "maxVolume": 10**9, "digits": 5}
+    c.symbol_meta[41] = {"minVolume": 100, "stepVolume": 100, "maxVolume": 200000, "digits": 2}
+    c.symbol_meta[101] = {"minVolume": 1, "stepVolume": 1, "maxVolume": 1000, "digits": 2}
+
+    assert c.relative_stop_from_distance(1, 0.00494493135466256) == 494            # FX: any integer is fine
+    gold = c.relative_stop_from_distance(41, 64.51975218141366)
+    btc = c.relative_stop_from_distance(101, 2009.4990976184747)
+    assert gold == 6452000 and gold % 1000 == 0                                   # was 6451975 (invalid)
+    assert btc == 200950000 and btc % 1000 == 0                                   # was 200949910 (invalid)
+    assert c.relative_stop_from_distance(41, 0.0001) == 1000                      # never below one tick
+
+
 def test_known_timeframes():
     assert PERIOD_MINUTES["H1"] == 60 and "H4" in PERIOD_MINUTES
 
