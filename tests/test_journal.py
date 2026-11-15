@@ -197,3 +197,28 @@ def test_seeded_entries_make_adopted_positions_count_as_bot_trades(tmp_path):
          "commission": 0.0, "balance": 1}
     rec = j._close_record(d, {x["position_id"]: x for x in j.records("entry")}[7])
     assert rec["bot"] is True and rec["r"] == 0.5
+
+
+def test_repeated_sync_failures_alert_once_then_report_recovery(tmp_path):
+    clock, sent = _Clock(), []
+    j = _journal(tmp_path, clock)
+    state = {"fail": True}
+
+    class C:
+        def deals_since(self, *a, **k):
+            if state["fail"]:
+                raise RuntimeError("Trading account is not authorized")
+            return []
+    c = C()
+    j.sync(_FakeClient())                                        # start the clock
+    args = dict(client=c, on_event=lambda k, d: sent.append((k, d)), equity_fn=lambda: 1.0,
+                positions_fn=lambda: {}, now=datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc))
+    for _ in range(6):
+        clock.t += 130
+        j.tick(**args)
+    errors = [d for k, d in sent if k == "error"]
+    assert len(errors) == 1 and "restart" in errors[0]["detail"]   # alerted once, not six times
+    state["fail"] = False
+    clock.t += 130
+    j.tick(**args)
+    assert [k for k, _ in sent][-1] == "recovered"

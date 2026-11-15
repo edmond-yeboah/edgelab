@@ -31,6 +31,7 @@ log = logging.getLogger("edgelab.journal")
 BACKTEST = {"pf": 1.53, "exp_r": 0.33, "trades_per_week": 1.7}
 MIN_TRADES_FOR_COMPARISON = 30      # below this, a profit factor or expectancy is mostly noise
 SYNC_EVERY = 120.0                  # seconds between deal-history checks while running
+SYNC_FAIL_ALERT_AFTER = 3          # consecutive failed syncs before alerting (~6 min)
 OVERLAP_MS = 10 * 60 * 1000         # re-read a little history each time; dedupe by deal id
 
 
@@ -54,6 +55,8 @@ class TradeJournal:
         self.state_path = self.dir / "state.json"
         self._clock = clock
         self._last_sync_wall = 0.0
+        self._sync_fails = 0
+        self._sync_alerted = False
         self._state = self._load_state()
         if "started" not in self._state:
             self._state["started"] = _iso(int(clock() * 1000))
@@ -190,8 +193,24 @@ class TradeJournal:
             self._last_sync_wall = wall
             try:
                 self.sync(client)
+                if self._sync_alerted:
+                    self._sync_alerted = False
+                    on_event("recovered", {})
+                self._sync_fails = 0
             except Exception as e:
                 log.warning("journal sync failed: %s", e)
+                self._sync_fails += 1
+                # Deal-history reads share the trading session, so a run of failures usually means the
+                # bot has lost its cTrader session (e.g. account auth revoked). Say so once, early.
+                if self._sync_fails >= SYNC_FAIL_ALERT_AFTER and not self._sync_alerted:
+                    self._sync_alerted = True
+                    try:
+                        on_event("error", {"detail": f"cTrader session looks broken: deal-history sync has "
+                                                     f"failed {self._sync_fails}x in a row ({e}). Positions keep "
+                                                     f"their server-side stops, but the bot may be blind. "
+                                                     f"Try: sudo systemctl restart edgelab"})
+                    except Exception:
+                        pass
         if self.weekly_due(now):
             try:
                 on_event("weekly", {"text": self.weekly_summary(now, equity_fn(), positions_fn())})

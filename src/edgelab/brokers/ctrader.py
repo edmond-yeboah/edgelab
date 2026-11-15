@@ -67,7 +67,7 @@ def _sdk():
 class CTraderConfig:
     def __init__(self, client_id: str, client_secret: str, access_token: str,
                  account_id: int, host_type: str = "demo",
-                 refresh_token: str = "", token_store: str | None = None):
+                 refresh_token: str = "", token_store: str | None = None, read_only: bool = False):
         if host_type not in ("demo", "live"):
             raise ValueError("host_type must be 'demo' or 'live'")
         self.client_id = client_id
@@ -78,6 +78,9 @@ class CTraderConfig:
         self.refresh_token = refresh_token
         # optional file to persist the (rotating) refresh token across restarts
         self.token_store = token_store
+        # read_only sessions (probes, research scripts run next to the live bot) must NEVER refresh the
+        # token: cTrader rotates it, which revokes the access token the running bot is using.
+        self.read_only = read_only
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +157,7 @@ class CTraderClient:
         reactor.callFromThread(lambda: hb.start(10.0, now=False))
 
         # refresh the access token daily (it expires in ~30 days) so a long run never dies on expiry.
-        if self.cfg.refresh_token:
+        if self.cfg.refresh_token and not self.cfg.read_only:
             from twisted.internet import threads
             rl = task.LoopingCall(lambda: threads.deferToThread(self._refresh_and_reauth))
             reactor.callFromThread(lambda: rl.start(24 * 3600, now=False))
@@ -181,17 +184,50 @@ class CTraderClient:
             except Exception as e:  # pragma: no cover
                 log.warning("could not write token store: %s", e)
 
+    def _load_persisted_access_token(self) -> None:
+        import os
+        path = (self.cfg.token_store or "") + ".access"
+        if self.cfg.token_store and os.path.exists(path):
+            try:
+                tok = open(path).read().strip()
+                if tok:
+                    self.cfg.access_token = tok
+            except Exception as e:  # pragma: no cover
+                log.warning("could not read access-token store: %s", e)
+
+    def _persist_access_token(self, token: str) -> None:
+        if self.cfg.token_store:
+            try:
+                with open(self.cfg.token_store + ".access", "w") as f:
+                    f.write(token)
+            except Exception as e:  # pragma: no cover
+                log.warning("could not write access-token store: %s", e)
+
+    def _app_auth(self) -> None:
+        """Application auth. 'Already authorized' means the socket's app session is fine (it happens when
+        re-authenticating a live connection), so it counts as success."""
+        try:
+            self._retry_call(lambda: self._req("ProtoOAApplicationAuthReq", clientId=self.cfg.client_id,
+                                               clientSecret=self.cfg.client_secret), "application auth")
+        except Exception as e:
+            if "ALREADY_LOGGED_IN" not in str(e):
+                raise
+            log.info("application already authorized on this connection; continuing to account auth")
+
     def _authenticate(self) -> None:
         """App auth, then best-effort token refresh, then account auth with the best token available.
 
         Used on first connect and on reconnect. A failed refresh no longer blocks auth: we fall back
         to the current access token, so a transient refresh error doesn't lock the bot out.
         """
-        self._retry_call(lambda: self._req("ProtoOAApplicationAuthReq", clientId=self.cfg.client_id,
-                                           clientSecret=self.cfg.client_secret), "application auth")
-        self._load_persisted_refresh_token()
-        if self.cfg.refresh_token:
-            self._try_refresh_token()   # best-effort; updates access_token on success
+        self._app_auth()
+        if self.cfg.read_only:
+            # Never refresh from a side script: use the access token the bot last persisted.
+            self._load_persisted_access_token()
+        else:
+            self._load_persisted_refresh_token()
+            if self.cfg.refresh_token:
+                self._try_refresh_token()   # best-effort; updates access_token on success
         # account auth can transiently fail (e.g. CANT_ROUTE_REQUEST) on a flaky/just-woken server
         self._retry_call(lambda: self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
                                            accessToken=self.cfg.access_token), "account auth")
@@ -205,6 +241,8 @@ class CTraderClient:
                 return self._call(make_msg())
             except Exception as e:
                 last = e
+                if "ALREADY_LOGGED_IN" in str(e):
+                    raise            # not transient: retrying can't change it
                 log.warning("%s failed (%s); retrying in %ss", what, e, delay)
                 time.sleep(delay)
         raise last
@@ -215,6 +253,7 @@ class CTraderClient:
         try:
             res = self._call(self._req("ProtoOARefreshTokenReq", refreshToken=self.cfg.refresh_token))
             self.cfg.access_token = res.accessToken
+            self._persist_access_token(res.accessToken)
             if getattr(res, "refreshToken", ""):
                 self.cfg.refresh_token = res.refreshToken
                 self._persist_refresh_token(res.refreshToken)

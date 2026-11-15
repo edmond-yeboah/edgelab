@@ -80,7 +80,8 @@ def get_data(args) -> dict[str, pd.DataFrame]:
             os.environ["CTRADER_CLIENT_ID"], os.environ["CTRADER_CLIENT_SECRET"],
             os.environ["CTRADER_ACCESS_TOKEN"], int(os.environ["CTRADER_ACCOUNT_ID"]), host_type="demo",
             refresh_token=os.environ.get("CTRADER_REFRESH_TOKEN", ""),
-            token_store=os.environ.get("CTRADER_TOKEN_STORE", ".ctrader_refresh_token"))
+            token_store=os.environ.get("CTRADER_TOKEN_STORE", ".ctrader_refresh_token"),
+        read_only=True)  # never refresh the token: that would knock the running bot offline
         client = CTraderClient(cfg)
         client.connect()
         for sym in args.symbols:
