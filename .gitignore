@@ -10,3 +10,6 @@ experiments/
 # token store
 .ctrader_refresh_token
 *.refresh_token
+
+# trade journal (runtime data, kept on the server)
+journal/

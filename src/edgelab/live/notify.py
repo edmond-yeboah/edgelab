@@ -114,6 +114,18 @@ class Notifier:
             held = f" Resuming {len(open_ps)} open: {', '.join(open_ps)}." if open_ps else ""
             return (f"✅ edgelab started — connected to {data.get('host', 'demo')} "
                     f"(equity=${data.get('equity')}). Watching: {syms}.{held}")
+        if kind == "missed_close":
+            # A close found in the broker's deal history that the bot did not announce live — e.g. a
+            # stop-out while the bot was restarting. Real exit price and net P&L from the broker.
+            side = "LONG" if data.get("direction", 0) > 0 else "SHORT"
+            net = data.get("net", 0.0)
+            emoji = "🟢" if net >= 0 else "🔴"
+            r = f" ({data['r']:+.2f}R)" if data.get("r") is not None else ""
+            who = "" if data.get("bot", True) else " [not a bot trade]"
+            return (f"📉 {data.get('symbol', '')} {side} closed while the bot wasn't watching{who}: "
+                    f"exit {data.get('exit_price')} {emoji} net {net:+.2f}{r} @ {data.get('at')}")
+        if kind == "weekly":
+            return data.get("text")
         if kind == "recovered":
             return "🔄 Reconnected to cTrader after an error — back to normal."
         if kind == "market_closed":

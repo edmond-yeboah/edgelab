@@ -127,3 +127,22 @@ def test_daily_account_summary_is_throttled_to_once_a_day():
     n._last_daily -= 86401                                               # a day passes
     n("account", {"ts": "t3", "equity": 101100, "kill_switch": False})
     assert len(t.sent) == 2
+
+
+def test_missed_close_message_shows_real_exit_net_and_flags_non_bot_trades():
+    t = LoggingTransport()
+    n = Notifier(t)
+    n("missed_close", {"symbol": "EURUSD", "direction": -1, "exit_price": 1.12059, "net": -503.20,
+                       "r": -1.006, "bot": True, "at": "2026-11-09T17:13:00Z"})
+    n("missed_close", {"symbol": "XAUUSD", "direction": 1, "exit_price": 3980.1, "net": -82.0,
+                       "bot": False, "at": "2026-11-09T12:00:00Z"})
+    bot, manual = t.sent
+    assert "EURUSD SHORT closed while the bot wasn't watching" in bot
+    assert "🔴" in bot and "-503.20" in bot and "-1.01R" in bot
+    assert "[not a bot trade]" in manual and "XAUUSD LONG" in manual
+
+
+def test_weekly_event_sends_the_prebuilt_text():
+    t = LoggingTransport()
+    Notifier(t)("weekly", {"text": "📊 Weekly summary — test"})
+    assert t.sent == ["📊 Weekly summary — test"]

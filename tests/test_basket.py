@@ -149,3 +149,39 @@ def test_basket_exits_after_too_many_consecutive_errors():
         BasketRunner(_ScriptClock(ts, client), [leg], equity_fn=lambda: 1000.0,
                      on_event=lambda k, d: None).run()
     assert leg.processed == 5                           # bailed out after 5 straight failures
+
+
+class _PollingClock(_ScriptClock):
+    """Like the real clock: calls the between-bar watch callback while 'waiting'."""
+    def wait_next(self, on_poll=None, poll_interval=0.0):
+        if on_poll and self._ts:
+            on_poll()
+        return super().wait_next(on_poll, poll_interval)
+
+
+class _WatchableLeg(_FailingLeg):
+    def __init__(self):
+        super().__init__(fail_times=0)
+        self.watched = 0
+    def watch(self, ts):
+        self.watched += 1
+        return False
+
+
+def test_housekeeping_tick_runs_every_watch_round():
+    ticks = {"n": 0}
+    client = types.SimpleNamespace(ensure_authenticated=lambda: None)
+    ts = list(pd.date_range("2026-01-01", periods=3, freq="4h", tz="UTC"))
+    leg = _WatchableLeg()
+    BasketRunner(_PollingClock(ts, client), [leg], equity_fn=lambda: 1000.0,
+                 on_tick=lambda: ticks.__setitem__("n", ticks["n"] + 1)).run()
+    assert leg.watched == 3 and ticks["n"] == 3
+
+
+def test_a_failing_housekeeping_tick_never_disturbs_trading():
+    client = types.SimpleNamespace(ensure_authenticated=lambda: None)
+    ts = list(pd.date_range("2026-01-01", periods=3, freq="4h", tz="UTC"))
+    leg = _WatchableLeg()
+    def boom(): raise RuntimeError("journal exploded")
+    BasketRunner(_PollingClock(ts, client), [leg], equity_fn=lambda: 1000.0, on_tick=boom).run()
+    assert leg.processed == 3                          # every bar still processed

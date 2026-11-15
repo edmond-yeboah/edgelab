@@ -114,6 +114,7 @@ class CTraderClient:
         self.symbol_meta: dict[int, dict] = {}   # symbolId -> {minVolume, stepVolume, maxVolume, digits}
         self._spot: dict[int, dict] = {}         # symbolId -> {bid, ask}
         self._exec_events: list = []
+        self._exec_lock = threading.Lock()   # _on_message runs on the reactor thread, legs on the main one
         self._last_exec_error: dict[int, str] = {}   # symbolId -> last rejection errorCode
         self._balance: float | None = None
         self._money_digits = 2
@@ -291,7 +292,10 @@ class CTraderClient:
                 d["ask"] = payload.ask / SCALE
             d["ts"] = time.time()   # last-tick time: lets us tell an open market from a closed one
         elif tn == "ProtoOAExecutionEvent":
-            self._exec_events.append(payload)
+            with self._exec_lock:
+                self._exec_events.append(payload)
+                if len(self._exec_events) > 500:          # never grow without bound
+                    del self._exec_events[:100]
             # Diagnostic: log the venue's execution type + error code for each order, so a rejected
             # order (e.g. gold/BTC bouncing) tells us exactly WHY (lot size, trading disabled, etc.).
             try:
@@ -464,8 +468,62 @@ class CTraderClient:
         return out
 
     def pop_exec_events(self) -> list:
-        ev, self._exec_events = self._exec_events, []
+        with self._exec_lock:
+            ev, self._exec_events = self._exec_events, []
         return ev
+
+    @staticmethod
+    def _event_symbol_id(ev) -> int | None:
+        for attr in ("position", "order"):
+            try:
+                sid = getattr(getattr(getattr(ev, attr), "tradeData"), "symbolId")
+            except AttributeError:
+                continue
+            if sid:
+                return sid
+        return None
+
+    def take_exec_events(self, symbol_id: int) -> list:
+        """Remove and return only the execution events for ONE symbol, leaving the other symbols'
+        events queued for their own legs. (The legs share this client: if each leg drained the whole
+        queue with pop_exec_events(), the first leg would throw away every other leg's stop-outs.)"""
+        with self._exec_lock:
+            mine = [e for e in self._exec_events if self._event_symbol_id(e) == symbol_id]
+            self._exec_events = [e for e in self._exec_events if self._event_symbol_id(e) != symbol_id]
+        return mine
+
+    def deals_since(self, since_ms: int, until_ms: int | None = None, max_rows: int = 1000) -> list[dict]:
+        """Account deal history (fills and closes) since a timestamp, normalised to plain dicts.
+        The server limits how wide one request's time window can be, so walk forward in 7-day chunks.
+        Money fields on closing deals are converted from integer cents to account currency."""
+        until_ms = until_ms or int(time.time() * 1000)
+        out, start, step = [], int(since_ms), 7 * 86400 * 1000
+        while start < until_ms:
+            end = min(start + step, until_ms)
+            res = self._call(self._req("ProtoOADealListReq", ctidTraderAccountId=self.cfg.account_id,
+                                       fromTimestamp=start, toTimestamp=end, maxRows=max_rows))
+            if getattr(res, "hasMore", False):
+                log.warning("deal history window %s..%s has more than %d rows; some deals not fetched",
+                            start, end, max_rows)
+            out.extend(self._normalize_deal(d) for d in res.deal)
+            start = end + 1
+        return sorted(out, key=lambda d: d["ts_ms"])
+
+    def _normalize_deal(self, d) -> dict:
+        has_close = d.HasField("closePositionDetail") if hasattr(d, "HasField") else bool(
+            getattr(d, "closePositionDetail", None))
+        sym = next((n for n, i in self.symbols.items() if i == d.symbolId), str(d.symbolId))
+        out = {"deal_id": d.dealId, "position_id": d.positionId, "order_id": d.orderId,
+               "symbol_id": d.symbolId, "symbol": sym,
+               "ts_ms": int(d.executionTimestamp or d.createTimestamp),
+               "price": d.executionPrice, "side": "BUY" if d.tradeSide == 1 else "SELL",
+               "volume": d.filledVolume or d.volume, "is_close": has_close}
+        if has_close:
+            c = d.closePositionDetail
+            k = 10 ** int(c.moneyDigits or d.moneyDigits or 2)
+            out.update(entry_price=c.entryPrice, gross=c.grossProfit / k, swap=c.swap / k,
+                       commission=c.commission / k, balance=c.balance / k, closed_volume=c.closedVolume)
+        return out
 
     def balance(self) -> float | None:
         return self._balance
@@ -488,6 +546,8 @@ class CTraderBroker(Broker):
         self._rejections: list[dict] = []
         self._label_prefix = f"edgelab-{uuid.uuid4().hex[:8]}"
         self._n = 0
+        self._last_sync = 0.0
+        self.journal = None        # optional TradeJournal; set by the runner
         assert_account_matches_mode(self.mode, client.account_is_live())
         client.subscribe_spots(symbol)
         for p in client.reconcile_positions():
@@ -531,6 +591,10 @@ class CTraderBroker(Broker):
         sid = self.client.symbol_id(self.symbol)
         side = "BUY" if direction > 0 else "SELL"
         venue = None
+        try:
+            ref_px = self.client.mid_price(self.symbol)     # price at decision time, to measure slippage
+        except Exception:
+            ref_px = None
 
         for attempt in range(1, attempts + 1):
             # Did a prior attempt (or a slow async fill) already open a position on this symbol?
@@ -570,6 +634,14 @@ class CTraderBroker(Broker):
         self._pos.venue_id = venue["positionId"]  # type: ignore[attr-defined]
         log.info("order FILLED %s %s qty=%s @ %.5f label=%s",
                  self.symbol, side, filled_qty, entry_px, self._pos.label)
+        if self.journal is not None:
+            try:
+                self.journal.record_entry(
+                    symbol=self.symbol, position_id=venue["positionId"], direction=vdir,
+                    qty=filled_qty, fill_price=entry_px, ref_price=ref_px, stop_distance=stop_distance,
+                    planned_stop=self._pos.stop, risk_amount=risk_amount, label=self._pos.label)
+            except Exception as e:                # the journal must never be able to break trading
+                log.warning("journal entry failed: %s", e)
         return self._pos
 
     def _confirm_fill(self, sid: int, label: str, attempts: int = 10, delay: float = 0.5) -> dict | None:
@@ -606,23 +678,66 @@ class CTraderBroker(Broker):
         self._pos = None
         self.client._refresh_balance()
 
+    def _mark_closed_by_venue(self) -> None:
+        """The venue closed our position (a server-side stop-out): record it and go flat."""
+        p = self._pos
+        if p is None:
+            return
+        exit_px = getattr(p, "stop", float("nan"))
+        if exit_px != exit_px:   # NaN: adopted position with no known stop
+            exit_px = self.client.mid_price(self.symbol) or p.entry_price
+        pnl = p.direction * (exit_px - p.entry_price) * p.qty
+        self._realized.append({"pnl": round(pnl, 2), "reason": "stop", "dir": p.direction})
+        self._events.append(CloseEvent(p.direction, "stop"))
+        self._pos = None
+        try:
+            self.client._refresh_balance()
+        except Exception:
+            pass
+
+    _SYNC_EVERY = 30.0     # seconds between venue cross-checks of an open position
+
+    def _sync_with_venue(self, force: bool = False) -> None:
+        """Safety net: if our position is no longer on the venue, it was closed behind our back (a
+        stop-out whose event we missed, or a manual close). Without this the leg would keep a stale
+        position forever and never re-enter. A failed lookup never changes state."""
+        if self._pos is None:
+            return
+        vid = getattr(self._pos, "venue_id", 0)
+        if not vid:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_sync < self._SYNC_EVERY:
+            return
+        self._last_sync = now
+        try:
+            positions = self.client.reconcile_positions()
+        except Exception as e:
+            log.debug("%s: venue sync skipped (%s)", self.symbol, e)
+            return
+        if any(p["positionId"] == vid for p in positions):
+            return
+        log.warning("%s: position %s is no longer on the venue; treating it as closed (stopped out)",
+                    self.symbol, vid)
+        self._mark_closed_by_venue()
+
     def pop_events(self) -> list[CloseEvent]:
-        # surface server-side stop-outs: if an execution event reports our position closed, emit a stop
-        for ev in self.client.pop_exec_events():
+        # Surface server-side stop-outs. Take only THIS symbol's execution events: the legs share one
+        # client, and draining the whole queue here would discard the other legs' stop-outs.
+        try:
+            sid = self.client.symbol_id(self.symbol)
+            take = getattr(self.client, "take_exec_events", None)
+            events = take(sid) if take else self.client.pop_exec_events()
+        except Exception:
+            events = []
+        for ev in events:
             try:
                 if self._pos is not None and ev.position.positionId == getattr(self._pos, "venue_id", -1) \
                         and ev.position.positionStatus == 2:  # CLOSED
-                    p = self._pos
-                    exit_px = getattr(p, "stop", float("nan"))
-                    if exit_px != exit_px:   # NaN: adopted position with no known stop
-                        exit_px = self.client.mid_price(self.symbol) or p.entry_price
-                    pnl = p.direction * (exit_px - p.entry_price) * p.qty
-                    self._realized.append({"pnl": round(pnl, 2), "reason": "stop", "dir": p.direction})
-                    self._events.append(CloseEvent(p.direction, "stop"))
-                    self._pos = None
-                    self.client._refresh_balance()
+                    self._mark_closed_by_venue()
             except Exception:
                 pass
+        self._sync_with_venue()
         ev, self._events = self._events, []
         return ev
 

@@ -42,8 +42,15 @@ def run_backtest(
     equity0: float = 500.0,
     trade_from: int = 0,
     reentry_cooldown_bars: int = 1,
+    flatten_gap_hours: float | None = None,
 ) -> BacktestResult:
-    """Run `strategy` over `df`. Bars before `trade_from` are warm-up only (no trading)."""
+    """Run `strategy` over `df`. Bars before `trade_from` are warm-up only (no trading).
+
+    flatten_gap_hours: if set, any open position is closed at the CLOSE of the last bar before a
+    gap in the data longer than this many hours (a weekend / market closure), reason "weekend_flat".
+    The strategy then re-enters on the first bar after the gap if its signal still says so. Markets
+    that never close (e.g. crypto) have no such gaps, so they are unaffected. Default None = hold
+    through gaps, which is what the live bot does."""
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Candles missing columns: {missing}")
@@ -60,11 +67,16 @@ def run_backtest(
     risk = RiskEngine(risk_cfg, instrument)
     engine = TradingEngine(broker, risk, reentry_cooldown_bars=reentry_cooldown_bars)
 
+    gap = pd.Timedelta(hours=flatten_gap_hours) if flatten_gap_hours else None
     for i in range(len(df)):
         broker.begin_bar(idx[i], o[i], h[i], l[i], c[i])
         if i > 0 and i >= trade_from:
             engine.on_signal(idx[i], int(dirs[i - 1]), float(stops[i - 1]))
         broker.end_bar()
+        if gap is not None and i + 1 < len(df) and broker.position() is not None \
+                and (idx[i + 1] - idx[i]) > gap:
+            broker.force_close_at(c[i], "weekend_flat")
+            broker.equity_curve[-1] = (idx[i], broker.equity())   # reflect the exit costs on this bar
         engine.after_bar(idx[i])
 
     broker.force_close_at(c[-1], "end_of_data")

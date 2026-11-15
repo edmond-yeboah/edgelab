@@ -82,6 +82,7 @@ class BasketRunner:
         equity_fn: Callable[[], float],
         cfg: BasketConfig | None = None,
         on_event: Callable[[str, dict], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
     ):
         if not legs:
             raise ValueError("BasketRunner needs at least one leg")
@@ -90,6 +91,7 @@ class BasketRunner:
         self.equity_fn = equity_fn
         self.cfg = cfg or BasketConfig()
         self.on_event = on_event or (lambda kind, data: None)
+        self.on_tick = on_tick    # housekeeping (journal sync, weekly summary), called every watch round
         for leg in legs:          # funnel every leg's events through the basket's single handler
             leg.on_event = self.on_event
         # account-level risk monitor (sizing fields unused; only drawdown/daily tracking)
@@ -164,3 +166,8 @@ class BasketRunner:
                 leg.watch(ts)
             except Exception as e:
                 log.warning("between-bar watch failed for %s: %s", getattr(leg, "name", "?"), e)
+        if self.on_tick is not None:
+            try:
+                self.on_tick()
+            except Exception as e:
+                log.warning("housekeeping tick failed: %s", e)

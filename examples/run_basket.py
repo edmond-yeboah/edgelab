@@ -43,6 +43,8 @@ def main() -> None:
     ap.add_argument("--equity", type=float, default=100000.0, help="shadow starting equity per account")
     ap.add_argument("--account-max-dd", type=float, default=20.0, help="account kill-switch drawdown %")
     ap.add_argument("--max-bars", type=int, default=None)
+    ap.add_argument("--journal-dir", default="journal",
+                    help="where the trade journal + state live (live mode only)")
     a = ap.parse_args()
 
     req = ["CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_ACCESS_TOKEN", "CTRADER_ACCOUNT_ID"]
@@ -109,10 +111,27 @@ def main() -> None:
     for leg in legs:
         p = leg.broker.position()
         startup_positions[leg.name] = None if p is None else {"dir": p.direction, "qty": p.qty}
+    journal, on_tick = None, None
+    if not a.shadow:
+        # Trade journal (entries by the broker, closes from cTrader's deal history) + weekly summary.
+        from edgelab.live.journal import TradeJournal
+        journal = TradeJournal(a.journal_dir)
+        for leg in legs:
+            leg.broker.journal = journal
+
+        def on_tick() -> None:
+            journal.tick(client, on_event, equity_fn,
+                         lambda: {leg.name: (None if leg.broker.position() is None else
+                                             {"dir": leg.broker.position().direction,
+                                              "qty": leg.broker.position().qty}) for leg in legs})
+
     on_event("started", {"host": cfg.host_type, "equity": round(equity_fn(), 2),
                          "symbols": a.symbols, "positions": startup_positions})
+    if journal is not None:
+        journal.startup_sync(client, on_event)     # announce closes that happened while the bot was down
     BasketRunner(clock, legs, equity_fn,
-                 cfg=BasketConfig(account_max_drawdown_pct=a.account_max_dd), on_event=on_event).run()
+                 cfg=BasketConfig(account_max_drawdown_pct=a.account_max_dd), on_event=on_event,
+                 on_tick=on_tick).run()
 
 
 if __name__ == "__main__":
