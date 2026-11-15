@@ -128,6 +128,15 @@ def main() -> None:
     on_event("started", {"host": cfg.host_type, "equity": round(equity_fn(), 2),
                          "symbols": a.symbols, "positions": startup_positions})
     if journal is not None:
+        # Positions adopted at startup have no entry record (opened before the journal existed):
+        # seed stand-ins so their closes count as bot trades (risk = nominal 0.5% of equity, estimated).
+        adopted = []
+        for leg in legs:
+            p = leg.broker.position()
+            if p is not None and getattr(p, "venue_id", 0):
+                adopted.append({"symbol": leg.name, "position_id": p.venue_id, "direction": p.direction,
+                                "qty": p.qty, "entry_price": p.entry_price})
+        journal.seed_open_positions(adopted, equity_fn() * a.risk_pct / 100.0)
         journal.startup_sync(client, on_event)     # announce closes that happened while the bot was down
     BasketRunner(clock, legs, equity_fn,
                  cfg=BasketConfig(account_max_drawdown_pct=a.account_max_dd), on_event=on_event,

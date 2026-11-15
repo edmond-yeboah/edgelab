@@ -183,3 +183,17 @@ def test_a_torn_last_line_does_not_break_reading(tmp_path):
     with open(j.path, "a") as f:
         f.write('{"type": "close", "deal_id": 7, "net"')        # crash mid-write
     assert len(j.records()) == 1
+
+
+def test_seeded_entries_make_adopted_positions_count_as_bot_trades(tmp_path):
+    j = TradeJournal(str(tmp_path))
+    pos = [{"symbol": "XAUUSD", "position_id": 7, "direction": -1, "qty": 7.0, "entry_price": 2000.0}]
+    assert j.seed_open_positions(pos, 500.0) == 1
+    assert j.seed_open_positions(pos, 500.0) == 0            # idempotent
+    e = j.records("entry")[0]
+    assert e["seeded"] is True and e["risk_amount"] == 500.0
+    d = {"deal_id": 1, "position_id": 7, "symbol": "XAUUSD", "ts_ms": 1, "price": 1990.0, "side": "BUY",
+         "volume": 700, "closed_volume": 700, "entry_price": 2000.0, "gross": 250.0, "swap": 0.0,
+         "commission": 0.0, "balance": 1}
+    rec = j._close_record(d, {x["position_id"]: x for x in j.records("entry")}[7])
+    assert rec["bot"] is True and rec["r"] == 0.5

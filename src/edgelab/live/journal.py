@@ -107,6 +107,22 @@ class TradeJournal:
         self._append(rec)
         return rec
 
+    def seed_open_positions(self, positions: list[dict], risk_amount: float) -> int:
+        """Give positions that were already open when the journal started (adopted, no entry record)
+        a stand-in entry, so their closes count as bot trades. risk_amount is an ESTIMATE (the bot's
+        nominal risk per trade at today's equity); these records are flagged seeded=True."""
+        known = {e["position_id"] for e in self.records("entry")}
+        n = 0
+        for p in positions:
+            pid = p.get("position_id")
+            if not pid or pid in known:
+                continue
+            self.record_entry(symbol=p.get("symbol"), position_id=pid, direction=p.get("direction"),
+                              qty=p.get("qty"), fill_price=p.get("entry_price"), ref_price=None,
+                              risk_amount=round(float(risk_amount), 2), seeded=True)
+            n += 1
+        return n
+
     # ---- closes (from the broker's deal history) -----------------------------------------------
     def _close_record(self, d: dict, entry: dict | None) -> dict:
         direction = 1 if d["side"] == "SELL" else -1          # a closing SELL ends a long
