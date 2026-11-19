@@ -155,6 +155,57 @@ def pooled_account(trades_by_sym: dict[str, pd.DataFrame], syms: list[str], equi
     }
 
 
+def split_trades(t: pd.DataFrame, cutoff: pd.Timestamp):
+    """Split one pair's trades into (in-sample, out-of-sample) by exit time."""
+    if len(t) == 0:
+        return t, t
+    return t[t["exit_time"] < cutoff], t[t["exit_time"] >= cutoff]
+
+
+def pair_stats(t: pd.DataFrame) -> dict:
+    if len(t) == 0:
+        return {"n": 0, "pf": float("nan"), "exp": float("nan")}
+    r = t["r_multiple"].to_numpy(float)
+    pf = r[r > 0].sum() / -r[r < 0].sum() if (r < 0).any() else float("inf")
+    return {"n": len(t), "pf": pf, "exp": float(r.mean())}
+
+
+def run_split(trades_by_sym: dict[str, pd.DataFrame], syms: list[str], equity: float, risk_frac: float):
+    """Out-of-sample discipline test: pick pairs on the FIRST half of history, then judge that exact
+    set on the SECOND half it never saw. If the first-half winners keep working, the edge is real;
+    if the winners reshuffle, 'keep what backtested well' is just curve-fitting."""
+    all_exits = pd.concat([trades_by_sym[s]["exit_time"] for s in syms if len(trades_by_sym[s])])
+    cutoff = all_exits.sort_values().iloc[len(all_exits) // 2]
+    print(f"\n{'='*92}\nOUT-OF-SAMPLE SPLIT  cutoff = {cutoff:%Y-%m-%d}  "
+          f"(pick pairs on the 1st half, test the SAME set on the 2nd)\n{'-'*92}")
+    print(f"{'pair':8}{'  | in-sample (pick on this)':<34}{'| out-of-sample (judge on this)':<34}")
+    print(f"{'':8}{'n':>6}{'PF':>8}{'exp_R':>9}   {'n':>6}{'PF':>8}{'exp_R':>9}")
+    selected = []
+    for s in syms:
+        h1, h2 = split_trades(trades_by_sym[s], cutoff)
+        a1, a2 = pair_stats(h1), pair_stats(h2)
+        pick = a1["exp"] > 0                       # rule fixed in ADVANCE: positive expectancy in-sample
+        if pick:
+            selected.append(s)
+        pf1 = "inf" if a1["pf"] == float("inf") else f"{a1['pf']:.2f}"
+        pf2 = "inf" if a2["pf"] == float("inf") else f"{a2['pf']:.2f}"
+        print(f"{s:8}{a1['n']:>6}{pf1:>8}{a1['exp']:>9.2f}   {a2['n']:>6}{pf2:>8}{a2['exp']:>9.2f}"
+              + ("   <- picked" if pick else ""))
+
+    print(f"\nPicked on 1st half (exp_R > 0): {', '.join(selected) or 'NONE'}")
+    if selected:
+        oos = {s: split_trades(trades_by_sym[s], cutoff)[1] for s in selected}
+        r = pooled_account(oos, selected, equity, risk_frac)
+        if r["trades"]:
+            killed = "-" if r["killed_at"] is None else f"{r['killed_at']:%Y-%m-%d}"
+            pf = "inf" if r["pf"] == float("inf") else f"{r['pf']:.2f}"
+            print(f"\nThat exact set, scored ONLY on the unseen 2nd half (${equity:,.0f}, 20% kill):")
+            print(f"  trades={r['trades']}  win%={r['win_rate']:.1f}  PF={pf}  exp_R={r['exp_r']:.2f}  "
+                  f"net%={r['net_pct']:.1f}  maxDD%={r['maxdd_pct']:.2f}  lose-streak={r['worst_losing_streak']}  killed={killed}")
+            print("  -> Real if PF>1.3 and no kill. If this is weak while the 1st half looked great, the")
+            print("     'pick the winners' approach is fitting noise and the small-account FX idea is out.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
@@ -163,6 +214,7 @@ def main() -> None:
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--equity", type=float, default=800.0)
     ap.add_argument("--risk-pct", type=float, default=0.75)
+    ap.add_argument("--split", action="store_true", help="run the out-of-sample selection test")
     a = ap.parse_args()
 
     data = get_data(a)
@@ -209,6 +261,9 @@ def main() -> None:
         pf = "inf" if r["pf"] == float("inf") else f"{r['pf']:.2f}"
         print(f"{name:22}{r['trades']:>8}{r['win_rate']:>7.1f}{pf:>7}{r['exp_r']:>8.2f}"
               f"{r['net_pct']:>9.1f}{r['maxdd_pct']:>9.2f}{r['worst_losing_streak']:>13}{killed:>18}")
+
+    if a.split:
+        run_split(trades_by_sym, a.symbols, a.equity, risk_frac)
 
     print(f"\n{'-'*92}")
     print("Read as: a basket is worth pursuing only if PF > ~1.3, maxDD stays well under 20% (no kill),")
