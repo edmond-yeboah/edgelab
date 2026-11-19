@@ -35,11 +35,18 @@ from edgelab.strategies import make_strategy
 # Clean USD-quoted majors only (5-digit, pip 0.0001, min 1000 units). USD/JPY and USD-base pairs
 # are left out of the first pass to avoid pip-scaling noise; add them once this shape is proven.
 DEFAULT_SYMBOLS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"]
-# Baskets to compare: name -> the pairs in it.
+# Per-symbol specifics. Everything not listed is a clean USD-quoted FX major (min 1000 units, fx costs).
+ASSET = {"BTCUSD": "crypto"}
+MIN_UNITS = {"BTCUSD": 0.01}        # broker minimum trade size, for the "sizes on $X?" check
+INSTR_MIN = {"BTCUSD": 0.0001}      # backtest instrument min (tiny, so the notional run never rejects)
+# Baskets to compare: name -> the pairs in it. (pooled() skips any pair not in --symbols)
 BASKETS = {
-    "EUR+GBP (2)":           ["EURUSD", "GBPUSD"],
-    "EUR+GBP+AUD+NZD (4)":   ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"],
+    "EURUSD only":                 ["EURUSD"],
+    "EUR+BTC (2, cross-asset)":    ["EURUSD", "BTCUSD"],
+    "EUR+GBP (2)":                 ["EURUSD", "GBPUSD"],
+    "EUR+GBP+AUD+NZD (4)":         ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"],
 }
+NOTIONAL = 100_000.0                 # capture full trade sets with no size rejection; R is scale-free
 
 
 def fetch_h4(client, sym: str, start_year: int) -> pd.DataFrame:
@@ -98,13 +105,17 @@ def get_data(args) -> dict[str, pd.DataFrame]:
     return data
 
 
-def backtest_pair(sym: str, df: pd.DataFrame, risk_pct: float, equity: float) -> pd.DataFrame:
-    _, cost, _ = load_config(asset_class="fx")
-    risk = RiskConfig(risk_per_trade_pct=risk_pct, daily_loss_limit_pct=100.0,
+def backtest_pair(sym: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Capture the FULL trade set at a large notional so sizing never rejects. The resulting
+    r_multiples are scale-free, so the real account size is applied later in pooled_account()."""
+    asset = ASSET.get(sym, "fx")
+    _, cost, _ = load_config(asset_class=asset)
+    risk = RiskConfig(risk_per_trade_pct=0.75, daily_loss_limit_pct=100.0,
                       max_drawdown_halt_pct=100.0, max_leverage=500.0)   # kill-switch applied later, at basket level
     strat = make_strategy("ema_trend", fast=30, slow=150, atr_mult=2.0)
-    inst = Instrument(sym, "fx", min_qty=1_000, qty_step=1_000)
-    res = run_backtest(df, strat, inst, cost, risk, equity, reentry_cooldown_bars=1)
+    mn = INSTR_MIN.get(sym, 1_000)
+    inst = Instrument(sym, asset, min_qty=mn, qty_step=mn)
+    res = run_backtest(df, strat, inst, cost, risk, NOTIONAL, reentry_cooldown_bars=1)
     return res.trades
 
 
@@ -229,12 +240,12 @@ def main() -> None:
     print(f"\n{'pair':8}{'bars':>7}{'trades':>8}{'PF':>7}{'exp_R':>8}{'maxDD%':>9}{'min-trade risk':>16}{'sizes?':>9}")
     for sym in a.symbols:
         df = data[sym]
-        t = backtest_pair(sym, df, a.risk_pct, a.equity)
+        t = backtest_pair(sym, df)
         trades_by_sym[sym] = t
-        # min-trade risk at current price: 1000 units * recent stop distance
+        # min-trade risk at current price: broker min units * recent stop distance (quote ccy ~ USD)
         strat = make_strategy("ema_trend", fast=30, slow=150, atr_mult=2.0)
         stop = float(strat.signals(df)["stop_distance"].dropna().iloc[-1])
-        min_risk = 1000 * stop
+        min_risk = MIN_UNITS.get(sym, 1000) * stop
         sizes = "YES" if min_risk <= budget else "no"
         if len(t):
             r = t["r_multiple"].to_numpy(float)
