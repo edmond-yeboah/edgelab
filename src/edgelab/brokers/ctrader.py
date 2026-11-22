@@ -118,6 +118,10 @@ class CTraderClient:
         self._spot: dict[int, dict] = {}         # symbolId -> {bid, ask}
         self._exec_events: list = []
         self._exec_lock = threading.Lock()   # _on_message runs on the reactor thread, legs on the main one
+        # Serialize token refresh + account re-auth. The daily refresh runs on a background thread while
+        # the main thread can re-auth on error/self-heal; two refreshes at once would rotate the token
+        # and revoke each other's access token (the exact failure we chase in prod). One at a time.
+        self._auth_lock = threading.RLock()
         self._last_exec_error: dict[int, str] = {}   # symbolId -> last rejection errorCode
         self._balance: float | None = None
         self._money_digits = 2
@@ -220,17 +224,18 @@ class CTraderClient:
         Used on first connect and on reconnect. A failed refresh no longer blocks auth: we fall back
         to the current access token, so a transient refresh error doesn't lock the bot out.
         """
-        self._app_auth()
-        if self.cfg.read_only:
-            # Never refresh from a side script: use the access token the bot last persisted.
-            self._load_persisted_access_token()
-        else:
-            self._load_persisted_refresh_token()
-            if self.cfg.refresh_token:
-                self._try_refresh_token()   # best-effort; updates access_token on success
-        # account auth can transiently fail (e.g. CANT_ROUTE_REQUEST) on a flaky/just-woken server
-        self._retry_call(lambda: self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
-                                           accessToken=self.cfg.access_token), "account auth")
+        with self._auth_lock:
+            self._app_auth()
+            if self.cfg.read_only:
+                # Never refresh from a side script: use the access token the bot last persisted.
+                self._load_persisted_access_token()
+            else:
+                self._load_persisted_refresh_token()
+                if self.cfg.refresh_token:
+                    self._try_refresh_token()   # best-effort; updates access_token on success
+            # account auth can transiently fail (e.g. CANT_ROUTE_REQUEST) on a flaky/just-woken server
+            self._retry_call(lambda: self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
+                                               accessToken=self.cfg.access_token), "account auth")
 
     def _retry_call(self, make_msg, what: str, attempts: int = 4, delay: float = 3.0):
         """Send a request, retrying a few times on a transient server error before giving up.
@@ -266,9 +271,10 @@ class CTraderClient:
     def _refresh_and_reauth(self) -> None:
         """Daily token refresh + re-auth. Best-effort; never raises into the reactor loop."""
         try:
-            if self._try_refresh_token():
-                self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
-                                     accessToken=self.cfg.access_token))
+            with self._auth_lock:
+                if self._try_refresh_token():
+                    self._call(self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
+                                         accessToken=self.cfg.access_token))
         except Exception as e:
             log.warning("re-auth after refresh failed (will retry next cycle): %s", e)
 

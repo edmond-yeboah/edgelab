@@ -58,10 +58,14 @@ class TelegramTransport:
 
 
 class Notifier:
-    def __init__(self, transport: Transport, heartbeat_every: int = 0):
-        """heartbeat_every: send a routine 'bar' update at most once per this many bars (0 = never)."""
+    def __init__(self, transport: Transport, heartbeat_every: int = 0, label: str = ""):
+        """heartbeat_every: send a routine 'bar' update at most once per this many bars (0 = never).
+        label: optional short prefix put in front of every message, so two bots sharing one Telegram
+        chat (e.g. the main FP Markets basket and a second Pepperstone EUR+BTC instance) can be told
+        apart. Empty (the default) leaves messages untouched, so the main bot is unaffected."""
         self.transport = transport
         self.heartbeat_every = heartbeat_every
+        self.label = label.strip()
         self._bars = 0
         self._last_position: dict[str, dict | None] = {}   # per symbol (basket-safe)
         self._last_daily = 0.0                             # last daily-status send (epoch secs)
@@ -71,6 +75,8 @@ class Notifier:
         msg = self._format(kind, data)
         if msg is None:
             return
+        if self.label:
+            msg = f"{self.label} {msg}"
         self.transport.send(msg)
 
     def _format(self, kind: str, data: dict) -> str | None:
@@ -167,8 +173,13 @@ class Notifier:
 
 
 def from_env(env: dict, heartbeat_every: int = 0) -> Notifier | None:
-    """Build a Telegram Notifier from env vars, or None if not configured."""
+    """Build a Telegram Notifier from env vars, or None if not configured.
+
+    EDGELAB_LABEL (optional) prefixes every message, so a second bot can share one Telegram chat and
+    still be distinguishable (e.g. EDGELAB_LABEL="[pepper-eurbtc]"). Unset -> no prefix.
+    """
     tok, chat = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
     if not tok or not chat:
         return None
-    return Notifier(TelegramTransport(tok, chat), heartbeat_every=heartbeat_every)
+    return Notifier(TelegramTransport(tok, chat), heartbeat_every=heartbeat_every,
+                    label=env.get("EDGELAB_LABEL", ""))

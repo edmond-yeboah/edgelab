@@ -48,6 +48,28 @@ def _mask(s: str) -> str:
     return f"{s[:4]}…{s[-4:]} (len {len(s)})" if s and len(s) > 8 else "set"
 
 
+def _merge_env(path: Path, updates: dict) -> None:
+    """Update KEY=value lines in place and append missing keys, PRESERVING every other line
+    (comments, TELEGRAM_*, EDGELAB_LABEL, CTRADER_TOKEN_STORE, ...). A new file just gets the updates.
+
+    The old behaviour overwrote the whole .env, which silently wiped any Telegram/label settings the
+    user had already put there before running this — a real footgun when setting up a second bot.
+    """
+    remaining = dict(updates)
+    out_lines: list[str] = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key in remaining:
+                    out_lines.append(f"{key}={remaining.pop(key)}")
+                    continue
+            out_lines.append(line)
+    out_lines.extend(f"{k}={v}" for k, v in remaining.items())
+    path.write_text("\n".join(out_lines) + "\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--client-id", required=True)
@@ -84,15 +106,15 @@ def main() -> None:
         print(f"  (couldn't auto-list accounts: {e}; find the ctidTraderAccountId in the cTrader portal)")
 
     env = Path(a.env_out)
-    lines = {
+    updates = {
         "CTRADER_CLIENT_ID": a.client_id,
         "CTRADER_CLIENT_SECRET": a.client_secret,
         "CTRADER_ACCESS_TOKEN": access,
         "CTRADER_REFRESH_TOKEN": refresh,
     }
     if demo_id is not None:
-        lines["CTRADER_ACCOUNT_ID"] = str(demo_id)
-    env.write_text("".join(f"{k}={v}\n" for k, v in lines.items()))
+        updates["CTRADER_ACCOUNT_ID"] = str(demo_id)
+    _merge_env(env, updates)   # preserve TELEGRAM_*, EDGELAB_LABEL, CTRADER_TOKEN_STORE, etc.
     print(f"\nWrote {env} (gitignored). "
           + ("Set CTRADER_ACCOUNT_ID is filled with your demo account." if demo_id is not None
              else "Add CTRADER_ACCOUNT_ID=<your demo ctidTraderAccountId> to it."))

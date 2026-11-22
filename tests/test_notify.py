@@ -146,3 +146,23 @@ def test_weekly_event_sends_the_prebuilt_text():
     t = LoggingTransport()
     Notifier(t)("weekly", {"text": "📊 Weekly summary — test"})
     assert t.sent == ["📊 Weekly summary — test"]
+
+
+def test_label_prefixes_every_message_and_is_inert_when_unset():
+    t = LoggingTransport()
+    n = Notifier(t, label="[pepper-eurbtc]")
+    n("error", {"detail": "boom"})
+    n("recovered", {"ts": "t1"})
+    n("started", {"host": "demo", "equity": 5000, "symbols": ["EURUSD", "BTCUSD"]})
+    assert t.sent and all(m.startswith("[pepper-eurbtc] ") for m in t.sent)
+    assert "Error: boom" in t.sent[0]
+    # No label -> messages are untouched, so the main bot is unaffected.
+    t2 = LoggingTransport()
+    Notifier(t2)("error", {"detail": "boom"})
+    assert t2.sent == ["⚠️ Error: boom"]
+
+
+def test_from_env_reads_edgelab_label():
+    base = {"TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "y"}
+    assert from_env({**base, "EDGELAB_LABEL": "[pepper-eurbtc]"}).label == "[pepper-eurbtc]"
+    assert from_env(base).label == ""      # absent -> no prefix

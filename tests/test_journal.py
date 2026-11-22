@@ -222,3 +222,46 @@ def test_repeated_sync_failures_alert_once_then_report_recovery(tmp_path):
     clock.t += 130
     j.tick(**args)
     assert [k for k, _ in sent][-1] == "recovered"
+
+
+def test_repeated_sync_failures_trigger_reauth_to_self_heal(tmp_path):
+    # A mid-bar session loss must self-heal between bars (not wait up to a whole H4 bar for the main
+    # cycle to re-auth): once the sync has failed enough times, the journal calls ensure_authenticated().
+    clock = _Clock()
+    reauths = {"n": 0}
+
+    class C:
+        def deals_since(self, *a, **k):
+            raise RuntimeError("Trading account is not authorized")
+        def ensure_authenticated(self):
+            reauths["n"] += 1
+    c = C()
+    j = _journal(tmp_path, clock)
+    j.sync(_FakeClient())                                       # start the clock
+    args = dict(client=c, on_event=lambda k, d: None, equity_fn=lambda: 1.0,
+                positions_fn=lambda: {}, now=datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc))
+    for _ in range(2):                                          # below the 3-fail threshold
+        clock.t += 130
+        j.tick(**args)
+    assert reauths["n"] == 0                                    # too early: no re-auth yet
+    for _ in range(3):                                          # cross the threshold
+        clock.t += 130
+        j.tick(**args)
+    assert reauths["n"] >= 1                                    # self-heal kicked in
+
+
+def test_reauth_failure_never_breaks_the_tick(tmp_path):
+    clock = _Clock()
+
+    class C:
+        def deals_since(self, *a, **k):
+            raise RuntimeError("Trading account is not authorized")
+        def ensure_authenticated(self):
+            raise RuntimeError("still broken")
+    j = _journal(tmp_path, clock)
+    j.sync(_FakeClient())
+    args = dict(client=C(), on_event=lambda k, d: None, equity_fn=lambda: 1.0,
+                positions_fn=lambda: {}, now=datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc))
+    for _ in range(4):                                          # must not raise even when re-auth fails
+        clock.t += 130
+        j.tick(**args)

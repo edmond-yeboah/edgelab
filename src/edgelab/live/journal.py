@@ -208,9 +208,23 @@ class TradeJournal:
                         on_event("error", {"detail": f"cTrader session looks broken: deal-history sync has "
                                                      f"failed {self._sync_fails}x in a row ({e}). Positions keep "
                                                      f"their server-side stops, but the bot may be blind. "
-                                                     f"Try: sudo systemctl restart edgelab"})
+                                                     f"Auto re-auth is being attempted; if alerts don't resume "
+                                                     f"shortly: sudo systemctl restart edgelab"})
                     except Exception:
                         pass
+                # Self-heal between bars. The journal sync and the between-bar watch are the ONLY things
+                # that touch the session between H4 bars; a de-auth here would otherwise leave the bot
+                # blind until the next bar (up to a full timeframe, ~4h on H4), because only the main bar
+                # cycle re-authenticates. Re-auth now so a mid-bar session loss recovers within a sync
+                # cycle. Best-effort and self-contained: it must never raise into the trading loop.
+                if self._sync_fails >= SYNC_FAIL_ALERT_AFTER:
+                    reauth = getattr(client, "ensure_authenticated", None)
+                    if callable(reauth):
+                        try:
+                            reauth()
+                            log.info("journal-triggered re-auth ok; next sync should recover")
+                        except Exception as re:
+                            log.warning("journal-triggered re-auth failed (will retry next cycle): %s", re)
         if self.weekly_due(now):
             try:
                 on_event("weekly", {"text": self.weekly_summary(now, equity_fn(), positions_fn())})

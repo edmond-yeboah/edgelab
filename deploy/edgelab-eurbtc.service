@@ -1,0 +1,20 @@
+[Unit]
+Description=edgelab EUR+BTC bot (Pepperstone cTrader demo — second, isolated instance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/edgelab-eurbtc
+# .env holds the Pepperstone cTrader creds + Telegram + EDGELAB_LABEL (see deploy/eurbtc.env.example).
+# Must be plain KEY=value lines (no `export`, no quotes) — which is exactly what ctrader_get_token.py writes.
+EnvironmentFile=/home/ubuntu/edgelab-eurbtc/.env
+Environment=PYTHONUNBUFFERED=1
+# EUR+BTC subset at 0.75% risk on the ~$5k demo (see the findings doc). The 20% account kill-switch stays.
+ExecStart=/home/ubuntu/edgelab-eurbtc/.venv/bin/python examples/run_basket.py --live --timeframe H4 --symbols EURUSD BTCUSD --risk-pct 0.75 --account-max-dd 20
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
