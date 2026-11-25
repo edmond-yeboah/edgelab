@@ -32,6 +32,34 @@ SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD", "BTCUSD"]
 ASSET = {"BTCUSD": "crypto"}  # everything else = fx
 
 
+def build_cfg(a, env):
+    """Validate env/args and build the CTraderConfig — no network, so it's unit-testable.
+    Raises SystemExit on a missing/invalid setting.
+
+    --no-refresh (read_only) consumes a shared access token another instance keeps fresh, so it does
+    NOT need CTRADER_ACCESS_TOKEN in env — but it does need the shared store's .access file to exist.
+    """
+    from edgelab.brokers.ctrader import CTraderConfig
+    req = ["CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_ACCOUNT_ID"]
+    if not a.no_refresh:
+        req.append("CTRADER_ACCESS_TOKEN")
+    missing = [k for k in req if not env.get(k)]
+    if missing:
+        raise SystemExit(f"Missing env vars: {missing}. See SETUP_CTRADER.md.")
+    token_store = env.get("CTRADER_TOKEN_STORE", ".ctrader_refresh_token")
+    if a.no_refresh and not os.path.exists(token_store + ".access"):
+        raise SystemExit(
+            f"--no-refresh needs the shared access token at {token_store}.access, but it isn't there yet. "
+            f"Point CTRADER_TOKEN_STORE at the owning (main) bot's token store — it writes .access on "
+            f"startup/refresh. Start the main bot first.")
+    return CTraderConfig(env["CTRADER_CLIENT_ID"], env["CTRADER_CLIENT_SECRET"],
+                         env.get("CTRADER_ACCESS_TOKEN", ""), int(env["CTRADER_ACCOUNT_ID"]),
+                         host_type="demo",   # basket is demo-only by design
+                         refresh_token=env.get("CTRADER_REFRESH_TOKEN", ""),
+                         token_store=token_store,
+                         read_only=a.no_refresh)   # read_only = consume the shared token, never refresh it
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     m = ap.add_mutually_exclusive_group(required=True)
@@ -45,19 +73,15 @@ def main() -> None:
     ap.add_argument("--max-bars", type=int, default=None)
     ap.add_argument("--journal-dir", default="journal",
                     help="where the trade journal + state live (live mode only)")
+    ap.add_argument("--no-refresh", action="store_true",
+                    help="don't own token refresh: read the access token another instance keeps fresh in the "
+                         "shared CTRADER_TOKEN_STORE (.access file). Use for a SECOND bot on the same approved "
+                         "cTrader app + token (a different account), so the two processes never rotate each "
+                         "other's token. The owning (main) bot must be the one that refreshes.")
     a = ap.parse_args()
 
-    req = ["CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_ACCESS_TOKEN", "CTRADER_ACCOUNT_ID"]
-    missing = [k for k in req if not os.environ.get(k)]
-    if missing:
-        raise SystemExit(f"Missing env vars: {missing}. See SETUP_CTRADER.md.")
-
-    from edgelab.brokers.ctrader import CTraderClient, CTraderConfig
-    cfg = CTraderConfig(os.environ["CTRADER_CLIENT_ID"], os.environ["CTRADER_CLIENT_SECRET"],
-                        os.environ["CTRADER_ACCESS_TOKEN"], int(os.environ["CTRADER_ACCOUNT_ID"]),
-                        host_type="demo",   # basket is demo-only by design
-                        refresh_token=os.environ.get("CTRADER_REFRESH_TOKEN", ""),
-                        token_store=os.environ.get("CTRADER_TOKEN_STORE", ".ctrader_refresh_token"))
+    cfg = build_cfg(a, os.environ)
+    from edgelab.brokers.ctrader import CTraderClient
     client = CTraderClient(cfg)
     client.connect()
     print(("SHADOW" if a.shadow else "LIVE") + " basket:", a.symbols,
