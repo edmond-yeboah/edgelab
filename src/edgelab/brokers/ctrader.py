@@ -218,24 +218,43 @@ class CTraderClient:
                 raise
             log.info("application already authorized on this connection; continuing to account auth")
 
-    def _authenticate(self) -> None:
-        """App auth, then best-effort token refresh, then account auth with the best token available.
+    def _account_auth_msg(self):
+        return self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
+                         accessToken=self.cfg.access_token)
 
-        Used on first connect and on reconnect. A failed refresh no longer blocks auth: we fall back
-        to the current access token, so a transient refresh error doesn't lock the bot out.
+    def _authenticate(self) -> None:
+        """App auth, then account auth with the token we already have — refreshing ONLY if it's rejected.
+
+        Used on first connect and on reconnect. We deliberately do NOT refresh on every re-auth:
+        refreshing rotates the token, and when a second instance shares this token (read_only) that
+        rotation briefly invalidates its copy and makes it flap. So we try the current token first and
+        refresh only when account auth comes back 'not authorized' — the signature of a stale/revoked
+        token. The daily refresh loop still rotates once a day to keep the token well clear of expiry.
+        read_only sessions never refresh at all; they consume the token the owner keeps fresh.
         """
         with self._auth_lock:
             self._app_auth()
+            # Use the freshest token we persisted (the owner updates .access on each refresh), not a
+            # possibly-stale env value — and for a read_only instance that IS the only source.
+            self._load_persisted_access_token()
             if self.cfg.read_only:
-                # Never refresh from a side script: use the access token the bot last persisted.
-                self._load_persisted_access_token()
-            else:
-                self._load_persisted_refresh_token()
-                if self.cfg.refresh_token:
-                    self._try_refresh_token()   # best-effort; updates access_token on success
-            # account auth can transiently fail (e.g. CANT_ROUTE_REQUEST) on a flaky/just-woken server
-            self._retry_call(lambda: self._req("ProtoOAAccountAuthReq", ctidTraderAccountId=self.cfg.account_id,
-                                               accessToken=self.cfg.access_token), "account auth")
+                self._retry_call(self._account_auth_msg, "account auth")
+                return
+            self._load_persisted_refresh_token()
+            try:
+                self._call(self._account_auth_msg())        # try the current token — no needless rotation
+                return
+            except Exception as e:
+                token_rejected = "not authorized" in str(e).lower()
+                if not (token_rejected and self.cfg.refresh_token):
+                    # transient/other error (e.g. CANT_ROUTE_REQUEST on a just-woken server): retry with
+                    # the SAME token — still no refresh.
+                    self._retry_call(self._account_auth_msg, "account auth")
+                    return
+                log.info("account auth rejected the token (%s); refreshing once and retrying", e)
+                if not self._try_refresh_token():
+                    raise
+                self._retry_call(self._account_auth_msg, "account auth")
 
     def _retry_call(self, make_msg, what: str, attempts: int = 4, delay: float = 3.0):
         """Send a request, retrying a few times on a transient server error before giving up.
